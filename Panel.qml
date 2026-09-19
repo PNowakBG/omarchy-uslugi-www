@@ -380,13 +380,13 @@ Panel {
           Repeater {
             model: root.posortowane
 
-            delegate: Rectangle {
+            delegate: CursorSurface {
               id: wiersz
               required property var modelData
               width: parent.width
-              height: wew.implicitHeight + Style.space(root.kompakt ? 8 : 16)
-              radius: Style.cornerRadius
-              color: mysz.containsMouse ? Qt.lighter(Color.background, 1.15) : Color.background
+              implicitHeight: wew.implicitHeight + Style.space(root.kompakt ? 8 : 16)
+              height: implicitHeight
+              foreground: root.foreground
 
               Column {
                 id: wew
