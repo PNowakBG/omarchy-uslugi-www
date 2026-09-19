@@ -6,7 +6,7 @@
 #   port nazwa unit       → dla usług roota: jednostka systemd, z której
 #                           czytane są metryki (CPU/RAM/uptime)
 #   port nazwa Docker     → nadpis środowiska wyświetlanego ludziom
-#                           (Docker / venv / Kubernetes / systemd / …)
+#                           (Docker / venv / Kubernetes / usługa w tle / …)
 #
 # Porty usług roota/systemowych pokazują się WYŁĄCZNIE, gdy są tu
 # zadeklarowane (etykieta „system").

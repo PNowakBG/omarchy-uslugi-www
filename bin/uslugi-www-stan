@@ -154,7 +154,7 @@ def srodowisko_procesu(pid):
         return "Kubernetes"
     m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cg)
     if m:
-        return "systemd"
+        return "usługa w tle"
     cmd = cmdline_tekst(pid)
     if "deploy/docker" in cmd or os.environ.get("GOSEK_WHISPER", "").startswith("/"):
         pass  # environ sprawdzamy niżej
@@ -286,7 +286,7 @@ def zbierz():
             jednostka = deklaracja[1] if len(deklaracja) > 1 and deklaracja[1].endswith(".service") else None
             pid = pid_po_jednostce(jednostka)
             tech = "usługa systemowa (root)"
-            srod = ("systemd" if pid else "usługa systemowa")
+            srod = ("usługa w tle" if pid else "usługa systemowa")
             wstaw(port, nazwa, adres, "system", srod, tech, pid, None, stan)
             continue
         nazwa_auto, tech = nazwa_z_profilu(pid, proces)
