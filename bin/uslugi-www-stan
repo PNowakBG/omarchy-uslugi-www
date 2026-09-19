@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# uslugi-www-stan — wykrywa lokalne usługi WWW (docker + procesy użytkownika)
+# i wypisuje JSON dla wtyczki paska pablo.uslugi.
+#
+#   uslugi-www-stan status          → {"ok":true,"uslugi":[{nazwa,url,port,zrodlo,adres}],"updatedAt"}
+#
+# Źródła danych:
+#   - `docker ps` (porty publikowane kontenerów) → zrodlo="docker"
+#   - `ss -tlnp` (gniazda nasłuchujące z widocznym procesem) → zrodlo="venv"
+#     gdy w cmdline procesu jest "venv", inaczej "proces"
+# Gniazda bez procesu (cudze/root), porty systemowe (dns, cups itd.) i
+# docker-proxy (już objęte wpisem kontenera) są pomijane.
+# Przyjazne nazwy: ~/.config/uslugi-www.map (linie "port nazwa"), wbudowane
+# domyślne dla portów Goseka. Wpis "port !" UKRYWA port. Gniazda bez widocznego
+# procesu (usługi roota, np. minio) pokażą się TYLKO gdy port jest w mapie —
+# wtedy zrodlo="system".
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Porty systemowe, które nie są "usługą WWW do kliknięcia".
+POMIJAJ_PORTY = {53, 22, 111, 631, 5353, 5900, 1716, 47984, 47989, 47990, 48010, 6000}
+# Procesy infrastruktury — nie usługowe serwery WWW.
+POMIJAJ_PROCESY = {"docker-proxy", "dockerd", "systemd", "sshd", "cupsd"}
+
+DOMYSLNE_NAZWY = {8787: "gosek-panel"}
+
+
+def przyjazne_nazwy():
+    """port → nazwa; '!' znaczy „ukryj port”. Nazwy z pliku nadpisują domyślne."""
+    nazwy = dict(DOMYSLNE_NAZWY)
+    plik = os.path.expanduser("~/.config/uslugi-www.map")
+    try:
+        with open(plik, encoding="utf-8") as f:
+            for linia in f:
+                czesci = linia.split(None, 1)
+                if len(czesci) == 2 and czesci[0].isdigit():
+                    nazwy[int(czesci[0])] = czesci[1].strip()
+    except OSError:
+        pass
+    return nazwy
+
+
+def host_url(adres):
+    a = adres.strip("[]")
+    if a in ("0.0.0.0", "::", "*", ""):
+        return "localhost"
+    if a == "::1":
+        return "localhost"
+    return a
+
+
+def uruchom(argv):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def kontenery():
+    """docker ps → [(nazwa, host_adres, port)], zrodlo=docker."""
+    wynik = []
+    out = uruchom(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"])
+    for linia in out.splitlines():
+        czesci = linia.split("\t", 1)
+        if len(czesci) != 2:
+            continue
+        nazwa, porty = czesci
+        for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
+            wynik.append((nazwa, m.group(1), int(m.group(2))))
+    return wynik
+
+
+def gniazda():
+    """ss -tlnp → [(adres, port, proces|None, pid|None)].
+
+    Gniazda cudzych procesów (usługi roota — minio, sunshine…) nie niosą
+    nazwy procesu bez uprawnień; rozstrzyga je dopiero mapa portów.
+    """
+    wynik = []
+    out = uruchom(["ss", "-tlnp"])
+    for linia in out.splitlines():
+        if not linia.startswith("LISTEN"):
+            continue
+        czesci = linia.split()
+        if len(czesci) < 4:
+            continue
+        lokalny = czesci[3]
+        adres, _, port = lokalny.rpartition(":")
+        if not port.isdigit():
+            continue
+        m = re.search(r'\("([^"]+)",pid=(\d+)', linia)
+        wynik.append((adres, int(port), m.group(1) if m else None,
+                      int(m.group(2)) if m else None))
+    return wynik
+
+
+def zrodlo_procesu(pid):
+    """'venv', gdy cmdline procesu wskazuje na środowisko venv, inaczej 'proces'."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", "replace").split("\0")
+        if any("venv" in cz for cz in cmdline):
+            return "venv"
+    except OSError:
+        pass
+    return "proces"
+
+
+def nazwa_procesu(pid, proces):
+    """Konkretna nazwa zamiast nazwy binarki, gdy da się wywnioskować.
+
+    Przeglądarki z --remote-debugging-port to narzędzia automatyzacji —
+    nazwę bierzemy z katalogu profilu (--user-data-dir), np.
+    ~/.hermes/lv-browser-profile → „lv-browser" (bez „-profile").
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            czesci = [c.decode("utf-8", "replace")
+                      for c in f.read().split(b"\0") if c]
+    except OSError:
+        return proces
+    if "--remote-debugging-port" not in czesci:
+        return proces
+    katalog = None
+    for i, c in enumerate(czesci):
+        if c == "--user-data-dir" and i + 1 < len(czesci):
+            katalog = czesci[i + 1]
+        elif c.startswith("--user-data-dir="):
+            katalog = c.split("=", 1)[1]
+    if not katalog:
+        return proces + "-devtools"
+    profil = os.path.basename(katalog.rstrip("/"))
+    if profil.endswith("-profile"):
+        profil = profil[: -len("-profile")]
+    return profil or proces + "-devtools"
+
+
+def zbierz():
+    nazwy = przyjazne_nazwy()
+    uslugi = {}
+    for nazwa, adres, port in kontenery():
+        uslugi[port] = {
+            "nazwa": nazwa,
+            "url": f"http://{host_url(adres)}:{port}",
+            "port": port,
+            "zrodlo": "docker",
+            "adres": host_url(adres),
+        }
+    for adres, port, proces, pid in gniazda():
+        if port in uslugi or port in POMIJAJ_PORTY:
+            continue
+        ukryj = nazwy.get(port) == "!"
+        if proces in POMIJAJ_PROCESY or ukryj:
+            continue
+        if proces is None:
+            # Usługa roota/systemowa: pokazujemy wyłącznie porty zadeklarowane
+            # w mapie (reszta to szum sieciowy — resolver, Sunshine itd.).
+            if port not in nazwy:
+                continue
+            uslugi[port] = {
+                "nazwa": nazwy[port],
+                "url": f"http://{host_url(adres)}:{port}",
+                "port": port,
+                "zrodlo": "system",
+                "adres": host_url(adres),
+            }
+            continue
+        uslugi[port] = {
+            "nazwa": nazwy.get(port) or nazwa_procesu(pid, proces),
+            "url": f"http://{host_url(adres)}:{port}",
+            "port": port,
+            "zrodlo": zrodlo_procesu(pid),
+            "adres": host_url(adres),
+        }
+    return sorted(uslugi.values(), key=lambda u: (u["zrodlo"] != "docker", u["port"]))
+
+
+def main():
+    try:
+        uslugi = zbierz()
+        print(json.dumps({"ok": True, "uslugi": uslugi,
+                          "updatedAt": time.strftime("%H:%M:%S")}, ensure_ascii=False))
+    except Exception as e:  # noqa: BLE001 — paskowa bramka: każda porażka to jawny błąd w JSON
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
