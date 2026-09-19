@@ -18,6 +18,12 @@ Panel {
   readonly property int refreshSec: Math.max(5, Number(setting("refreshIntervalSec", 15)))
   readonly property int histMax: 12
 
+  // kolory z MOTYWU (nie z paska) — czytelne na jasnym i ciemnym tle;
+  // przygaszony tekst przez przezroczystość (Qt.darker daje czerń na ciemnym)
+  readonly property color foreground: Color.foreground
+  readonly property color dim: Qt.alpha(Color.foreground, 0.55)
+  readonly property string fontFamily: Style.font.family
+
   property var uslugi: []
   // port → tablica ostatnich odczytów CPU (liczby albo -1 = brak danych)
   property var cpuHist: ({})
