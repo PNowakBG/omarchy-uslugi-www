@@ -152,18 +152,40 @@ def srodowisko_procesu(pid):
     cg = cgroup_tekst(pid)
     if "kubepods" in cg:
         return "Kubernetes"
+    if "libpod" in cg or "podman" in cg:
+        return "Podman"
+    if "machine.slice" in cg:
+        return "maszyna wirtualna"
+    if "lxc.payload" in cg:
+        return "kontener LXC"
     m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cg)
     if m:
         return "usługa w tle"
+    if os.path.exists(f"/proc/{pid}/root/.flatpak-info"):
+        return "Flatpak"
     cmd = cmdline_tekst(pid)
-    if "deploy/docker" in cmd or os.environ.get("GOSEK_WHISPER", "").startswith("/"):
-        pass  # environ sprawdzamy niżej
+    if "/snap/" in cmd:
+        return "Snap"
+    if ".AppImage" in cmd:
+        return "AppImage"
     if "deploy/docker" in cmd:
         return "Docker"
     if "venv" in cmd:
         return "venv"
     if "--remote-debugging-port" in cmd:
         return "devtools"
+    exe = ""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            exe = f.read().split("(",  1)[1].split(")")[0]
+    except (OSError, IndexError):
+        pass
+    if exe == "java":
+        return "aplikacja Java"
+    if exe == "node" or re.search(r"\b(npm|vite|next|npx) ", cmd):
+        return "Node.js"
+    if exe.startswith("python") or re.search(r"\b(uvicorn|gunicorn|flask) ", cmd):
+        return "Python"
     return "proces lokalny"
 
 

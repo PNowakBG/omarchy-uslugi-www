@@ -36,6 +36,13 @@ Helper `bin/uslugi-www-stan status` (python3, stdlib) scala dwa źródła:
   - **proces roota/systemowy bez nazwy** (minio, sunshine…) → pokazany
     WYŁĄCZNIE, jeśli port zadeklarujesz w mapie (etykieta `system`).
 
+Rozpoznawane środowiska (etykieta dla ludzi): **Docker** (z projektem
+compose), **Kubernetes** (cgroup `kubepods`), **Podman**, **maszyna
+wirtualna** (libvirt/QEMU), **kontener LXC**, **usługa w tle** (unit
+systemd), **Flatpak**, **Snap**, **AppImage**, **venv**, **devtools**
+(przeglądarka pod zdalnym sterowaniem), **aplikacja Java**, **Node.js**,
+**Python**, **proces lokalny**. Wszystko da się nadpisać w mapie.
+
 Porty systemowe (DNS 53, CUPS 631, Sunshine 47984–48010, SSH…) są pomijane.
 
 ## Przyjazne nazwy i ukrywanie: `~/.config/local-www.map`
