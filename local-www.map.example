@@ -1,10 +1,17 @@
-# Przyjazne nazwy portów dla widgetu „Usługi WWW" (pablo.uslugi).
-# Format:  port nazwa          → port pokazywany pod tą nazwą
-#          port !              → port ukryty
-# Porty usług roota/systemowych (bez widocznego procesu) pokazują się
-# WYŁĄCZNIE, gdy są tu zadeklarowane (etykieta „system").
-9000 minio-s3
-9001 minio-konsola
+# local-www.map — nazwy, ukrywanie i środowiska portów dla „Usługi WWW".
+#
+# Format:  port nazwa [unit.service] [środowisko]
+#   port nazwa            → przyjazna nazwa (nadpisuje nazwę procesu)
+#   port nazwa !          → port ukryty
+#   port nazwa unit       → dla usług roota: jednostka systemd, z której
+#                           czytane są metryki (CPU/RAM/uptime)
+#   port nazwa Docker     → nadpis środowiska wyświetlanego ludziom
+#                           (Docker / venv / Kubernetes / systemd / …)
+#
+# Porty usług roota/systemowych pokazują się WYŁĄCZNIE, gdy są tu
+# zadeklarowane (etykieta „system").
+9000 minio-s3 minio.service
+9001 minio-konsola minio.service
 # Przeglądarka automatyzacji LasVegas (DevTools, profil ~/.hermes/lv-browser-profile)
 9222 lasvegas
-
+8787 gosek-panel Docker

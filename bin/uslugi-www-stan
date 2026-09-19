@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-# uslugi-www-stan — wykrywa lokalne usługi WWW (docker + procesy użytkownika)
-# i wypisuje JSON dla wtyczki paska pablo.uslugi.
+# uslugi-www-stan — wykrywa lokalne usługi WWW (docker, procesy, usługi
+# systemowe) i opisuje je językiem zrozumiałym dla nietechników:
+# w CZYM działają (Docker / venv / Kubernetes / systemd), od kiedy chodzą
+# i ile zużywają CPU i RAM.
 #
-#   uslugi-www-stan status          → {"ok":true,"uslugi":[{nazwa,url,port,zrodlo,adres}],"updatedAt"}
+#   uslugi-www-stan status          → {"ok":true,"uslugi":[...],"updatedAt":...}
 #
-# Źródła danych:
-#   - `docker ps` (porty publikowane kontenerów) → zrodlo="docker"
-#   - `ss -tlnp` (gniazda nasłuchujące z widocznym procesem) → zrodlo="venv"
-#     gdy w cmdline procesu jest "venv", inaczej "proces"
-# Gniazda bez procesu (cudze/root), porty systemowe (dns, cups itd.) i
-# docker-proxy (już objęte wpisem kontenera) są pomijane.
-# Przyjazne nazwy: ~/.config/local-www.map (linie "port nazwa"), wbudowane
-# domyślne dla portów Goseka. Wpis "port !" UKRYWA port. Gniazda bez widocznego
-# procesu (usługi roota, np. minio) pokażą się TYLKO gdy port jest w mapie —
-# wtedy zrodlo="system".
+# Jedna usługa:
+#   nazwa, url, port, zrodlo (docker|system|venv|proces),
+#   srodowisko (Docker|Kubernetes|venv|systemd|usługa systemowa|proces),
+#   tech (szczegół dla dociekliwych), cpu (%), mem_mb, uptime_s.
+#
+# CPU liczymy z różnicy taktów /proc/PID/stat między odświeżeniami
+# (stan w ~/.cache/uslugi-www-stan.json). Metryki kontenerów bierzemy
+# z pidu głównego procesu kontenera (docker inspect .State.Pid).
 
 import json
 import os
@@ -22,27 +22,34 @@ import subprocess
 import sys
 import time
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-
-# Porty systemowe, które nie są "usługą WWW do kliknięcia".
 POMIJAJ_PORTY = {53, 22, 111, 631, 5353, 5900, 1716, 47984, 47989, 47990, 48010, 6000}
-# Procesy infrastruktury — nie usługowe serwery WWW.
 POMIJAJ_PROCESY = {"docker-proxy", "dockerd", "systemd", "sshd", "cupsd"}
-
 DOMYSLNE_NAZWY = {8787: "gosek-panel"}
+CACHE = os.path.expanduser("~/.cache/uslugi-www-stan.json")
+HZ = os.sysconf("SC_CLK_TCK")
+STRONA = os.sysconf("SC_PAGE_SIZE")
+
+
+def uruchom(argv, timeout=15):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def przyjazne_nazwy():
-    """port → nazwa; '!' znaczy „ukryj port”. Nazwy z pliku nadpisują domyślne."""
-    nazwy = dict(DOMYSLNE_NAZWY)
+    """port → [nazwa, jednostka?]; '!' ukrywa port. Plik ~/.config/local-www.map
+    (stara nazwa uslugi-www.map działa dalej). Format: `port nazwa [unit]`."""
+    nazwy = {p: [n] for p, n in DOMYSLNE_NAZWY.items()}
     for plik in (os.path.expanduser("~/.config/local-www.map"),
-                 os.path.expanduser("~/.config/local-www.map")):  # stara nazwa
+                 os.path.expanduser("~/.config/uslugi-www.map")):
         try:
             with open(plik, encoding="utf-8") as f:
                 for linia in f:
-                    czesci = linia.split(None, 1)
-                    if len(czesci) == 2 and czesci[0].isdigit():
-                        nazwy[int(czesci[0])] = czesci[1].strip()
+                    czesci = linia.split()
+                    if len(czesci) >= 2 and czesci[0].isdigit():
+                        nazwy[int(czesci[0])] = czesci[1:]
         except OSError:
             continue
     return nazwy
@@ -50,55 +57,176 @@ def przyjazne_nazwy():
 
 def host_url(adres):
     a = adres.strip("[]")
-    if a in ("0.0.0.0", "::", "*", ""):
-        return "localhost"
-    if a == "::1":
+    if a in ("0.0.0.0", "::", "*", "", "::1"):
         return "localhost"
     return a
 
 
-def uruchom(argv):
+def cmdline_tekst(pid):
+    """Cmdline jako tekst. Programy typu setproctitle (chromium) przepisują
+    argv w jeden string ze spacjami."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        return r.stdout
-    except (OSError, subprocess.SubprocessError):
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ")
+    except OSError:
         return ""
 
 
+def cgroup_tekst(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def btime():
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            for linia in f:
+                if linia.startswith("btime"):
+                    return int(linia.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+# ── metryki ─────────────────────────────────────────────────────────────────
+
+def stan_cache():
+    try:
+        with open(CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def zapisz_cache(stan):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w", encoding="utf-8") as f:
+            json.dump(stan, f)
+    except OSError:
+        pass
+
+
+def metryki(pid, stan, teraz):
+    """(cpu %|None, mem_mb|None, uptime_s|None) z /proc/PID/stat."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            pola = f.read().rsplit(") ", 1)[1].split()
+        utime, stime = int(pola[11]), int(pola[12])   # po ) offset: 14-2, 15-2
+        startticks = int(pola[19])
+        rss = int(pola[21])
+    except (OSError, IndexError, ValueError):
+        return None, None, None
+    ticks = utime + stime
+    klucz = str(pid)
+    poprzednie = stan.get(klucz)
+    cpu = None
+    if poprzednie and teraz > poprzednie[1]:
+        dt = teraz - poprzednie[1]
+        cpu = max(0.0, (ticks - poprzednie[0]) / HZ / dt * 100.0)
+    stan[klucz] = [ticks, teraz]
+    mem_mb = rss * STRONA / 1024 / 1024
+    uptime = max(0, int(teraz - (BTIME + startticks / HZ)))
+    return round(cpu, 1) if cpu is not None else None, round(mem_mb, 1), uptime
+
+
+def format_uptime(s):
+    if s is None:
+        return ""
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    if s < 86400:
+        return f"{s // 3600} h {s % 3600 // 60:02d} min"
+    return f"{s // 86400} d {s % 86400 // 3600} h"
+
+
+# ── środowisko ──────────────────────────────────────────────────────────────
+
+def srodowisko_procesu(pid):
+    """Zrozumiała odpowiedź: W CZYM działa usługa."""
+    cg = cgroup_tekst(pid)
+    if "kubepods" in cg:
+        return "Kubernetes"
+    m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cg)
+    if m:
+        return "systemd"
+    cmd = cmdline_tekst(pid)
+    if "deploy/docker" in cmd or os.environ.get("GOSEK_WHISPER", "").startswith("/"):
+        pass  # environ sprawdzamy niżej
+    if "deploy/docker" in cmd:
+        return "Docker"
+    if "venv" in cmd:
+        return "venv"
+    if "--remote-debugging-port" in cmd:
+        return "devtools"
+    return "proces lokalny"
+
+
+def environ_tekst(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ")
+    except OSError:
+        return ""
+
+
+def pid_po_jednostce(jednostka):
+    """Znajdź pid procesu należącego do jednostki systemd (np. minio.service)."""
+    if not jednostka:
+        return None
+    for wp in os.listdir("/proc"):
+        if not wp.isdigit():
+            continue
+        if jednostka in cgroup_tekst(wp):
+            return int(wp)
+    return None
+
+
+# ── źródła usług ────────────────────────────────────────────────────────────
+
 def kontenery():
-    """docker ps → [(nazwa, host_adres, port, tech)], zrodlo=docker."""
+    """docker ps + inspect → [(nazwa, adres, port, srodowisko, tech, pid, start_s)]."""
     wynik = []
     out = uruchom(["docker", "ps", "--format",
-                   "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Ports}}"])
+                   "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Ports}}\t{{.ID}}"])
     for linia in out.splitlines():
-        czesci = linia.split("\t", 2)
-        if len(czesci) != 3:
+        czesci = linia.split("\t", 3)
+        if len(czesci) != 4:
             continue
-        nazwa, compose, porty = czesci
-        tech = "docker"
-        if compose:
-            tech = f"docker compose: {compose}"
+        nazwa, compose, porty, cid = czesci
+        insp = uruchom(["docker", "inspect", "--format",
+                        "{{.State.StartedAt}}\t{{.State.Pid}}", cid])
+        start_s, pid = None, None
+        cz = insp.strip().split("\t")
+        if len(cz) == 2:
+            try:
+                t = time.strptime(cz[0][:19], "%Y-%m-%dT%H:%M:%S")
+                start_s = max(0, int(time.time() - time.mktime(t)))
+            except ValueError:
+                pass
+            pid = int(cz[1]) if cz[1].isdigit() else None
+        tech = "docker" + (f" compose: {compose}" if compose else "")
         for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
-            wynik.append((nazwa, m.group(1), int(m.group(2)), tech))
+            wynik.append((nazwa, m.group(1), int(m.group(2)), "Docker", tech, pid, start_s))
     return wynik
 
 
 def gniazda():
-    """ss -tlnp → [(adres, port, proces|None, pid|None)].
-
-    Gniazda cudzych procesów (usługi roota — minio, sunshine…) nie niosą
-    nazwy procesu bez uprawnień; rozstrzyga je dopiero mapa portów.
-    """
+    """ss -tlnp → [(adres, port, proces|None, pid|None)] — także gniazda
+    usług roota (bez nazwy procesu); te rozstrzyga mapa portów."""
     wynik = []
-    out = uruchom(["ss", "-tlnp"])
-    for linia in out.splitlines():
+    for linia in uruchom(["ss", "-tlnp"]).splitlines():
         if not linia.startswith("LISTEN"):
             continue
         czesci = linia.split()
         if len(czesci) < 4:
             continue
-        lokalny = czesci[3]
-        adres, _, port = lokalny.rpartition(":")
+        adres, _, port = czesci[3].rpartition(":")
         if not port.isdigit():
             continue
         m = re.search(r'\("([^"]+)",pid=(\d+)', linia)
@@ -107,111 +235,95 @@ def gniazda():
     return wynik
 
 
-def cmdline_tekst(pid):
-    """Cmdline procesu jako tekst. Chromium i inne setproctitle'owe programy
-    przepisują argv w jeden string ze spacjami — split po NUL by mylił."""
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().decode("utf-8", "replace").replace("\0", " ")
-    except OSError:
-        return ""
+def nazwa_z_profilu(pid, proces):
+    cmd = cmdline_tekst(pid)
+    if "--remote-debugging-port" not in cmd:
+        return proces, proces
+    m = re.search(r"--user-data-dir[=\s](\S+)", cmd)
+    if not m:
+        return proces + "-devtools", "devtools (przeglądarka)"
+    profil = os.path.basename(m.group(1).rstrip("/"))
+    if profil.endswith("-profile"):
+        profil = profil[: -len("-profile")]
+    return (profil or proces + "-devtools"), "devtools (przeglądarka)"
+
+
+def zbierz():
+    nazwy = przyjazne_nazwy()
+    stan = stan_cache()
+    teraz = time.time()
+    uslugi = {}
+
+    def wstaw(port, nazwa, adres, zrodlo, srod, tech, pid, start_s, stan_proc):
+        cpu, mem, up = (None, None, None)
+        if pid:
+            cpu, mem, up = metryki(pid, stan_proc, teraz)
+        elif start_s:
+            up = start_s
+        uslugi[port] = {
+            "nazwa": nazwa, "url": f"http://{host_url(adres)}:{port}", "port": port,
+            "zrodlo": zrodlo, "srodowisko": srod, "tech": tech,
+            "cpu": cpu, "mem_mb": mem, "uptime_s": up, "adres": host_url(adres),
+        }
+
+    for nazwa, adres, port, srod, tech, pid, start_s in kontenery():
+        wstaw(port, nazwa, adres, "docker", srod, tech, pid, start_s, stan)
+
+    for adres, port, proces, pid in gniazda():
+        if port in uslugi or port in POMIJAJ_PORTY:
+            continue
+        deklaracja = nazwy.get(port)
+        if deklaracja and deklaracja[0] == "!":
+            continue
+        if proces in POMIJAJ_PROCESY:
+            continue
+        if proces is None:
+            # Usługa roota/systemowa — tylko porty zadeklarowane w mapie.
+            # 2. token mapy: jednostka systemd → metryki z /proc.
+            if not deklaracja:
+                continue
+            nazwa = deklaracja[0]
+            jednostka = deklaracja[1] if len(deklaracja) > 1 and deklaracja[1].endswith(".service") else None
+            pid = pid_po_jednostce(jednostka)
+            tech = "usługa systemowa (root)"
+            srod = ("systemd" if pid else "usługa systemowa")
+            wstaw(port, nazwa, adres, "system", srod, tech, pid, None, stan)
+            continue
+        nazwa_auto, tech = nazwa_z_profilu(pid, proces)
+        srod = srodowisko_procesu(pid)
+        # Gosek: usługa w venv/dockerze rozpoznaje się po environ (drop-in)
+        env = environ_tekst(pid)
+        if "GOSEK_WHISPER=/home" in env and "deploy/docker" in env:
+            srod = "Docker"
+        elif "deploy/docker" in env:
+            srod = "Docker"
+        # mapowy nadpis środowiska: `port nazwa [unit] [Docker|venv|Kubernetes|…]`
+        if deklaracja:
+            for tok in deklaracja[1:]:
+                if not tok.endswith(".service"):
+                    srod = tok
+        wstaw(port, nazwy.get(port, [nazwa_auto])[0], adres,
+              zrodlo_procesu(pid), srod, tech, pid, None, stan)
+
+    zapisz_cache({k: v for k, v in stan.items()
+                  if isinstance(v, list) and len(v) == 2})
+    return sorted(uslugi.values(), key=lambda u: (u["zrodlo"] != "docker", u["port"]))
 
 
 def zrodlo_procesu(pid):
-    """'venv', gdy cmdline procesu wskazuje na środowisko venv, inaczej 'proces'."""
     if "venv" in cmdline_tekst(pid):
         return "venv"
     return "proces"
 
 
-def nazwa_procesu(pid, proces):
-    """Konkretna nazwa zamiast nazwy binarki, gdy da się wywnioskować.
-
-    Przeglądarki z --remote-debugging-port to narzędzia automatyzacji —
-    nazwę bierzemy z katalogu profilu (--user-data-dir), np.
-    ~/.hermes/lv-browser-profile → „lv-browser" (bez „-profile").
-    """
-    cmd = cmdline_tekst(pid)
-    if "--remote-debugging-port" not in cmd:
-        return proces
-    m = re.search(r"--user-data-dir[=\s](\S+)", cmd)
-    if not m:
-        return proces + "-devtools"
-    profil = os.path.basename(m.group(1).rstrip("/"))
-    if profil.endswith("-profile"):
-        profil = profil[: -len("-profile")]
-    return profil or proces + "-devtools"
-
-
-def tech_procesu(pid, proces):
-    """Technologia uruchomienia: unit systemd, venv, devtools albo binarka."""
-    try:
-        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
-            cgroup = f.read()
-    except OSError:
-        cgroup = ""
-    m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cgroup)
-    if m:
-        unit = m.group(1)
-        czy_user = "user@" in cgroup or "/app.slice/" in cgroup
-        return f"systemd: {unit}" + (" (--user)" if czy_user else "")
-    if zrodlo_procesu(pid) == "venv":
-        return "venv"
-    cmd = cmdline_tekst(pid)
-    if "--remote-debugging-port" in cmd:
-        return f"devtools ({proces})"
-    return proces
-
-
-def zbierz():
-    nazwy = przyjazne_nazwy()
-    uslugi = {}
-    for nazwa, adres, port, tech in kontenery():
-        uslugi[port] = {
-            "nazwa": nazwa,
-            "url": f"http://{host_url(adres)}:{port}",
-            "port": port,
-            "zrodlo": "docker",
-            "tech": tech,
-            "adres": host_url(adres),
-        }
-    for adres, port, proces, pid in gniazda():
-        if port in uslugi or port in POMIJAJ_PORTY:
-            continue
-        ukryj = nazwy.get(port) == "!"
-        if proces in POMIJAJ_PROCESY or ukryj:
-            continue
-        if proces is None:
-            # Usługa roota/systemowa: pokazujemy wyłącznie porty zadeklarowane
-            # w mapie (reszta to szum sieciowy — resolver, Sunshine itd.).
-            if port not in nazwy:
-                continue
-            uslugi[port] = {
-                "nazwa": nazwy[port],
-                "url": f"http://{host_url(adres)}:{port}",
-                "port": port,
-                "zrodlo": "system",
-                "tech": "usługa systemowa (root)",
-                "adres": host_url(adres),
-            }
-            continue
-        uslugi[port] = {
-            "nazwa": nazwy.get(port) or nazwa_procesu(pid, proces),
-            "url": f"http://{host_url(adres)}:{port}",
-            "port": port,
-            "zrodlo": zrodlo_procesu(pid),
-            "tech": tech_procesu(pid, proces),
-            "adres": host_url(adres),
-        }
-    return sorted(uslugi.values(), key=lambda u: (u["zrodlo"] != "docker", u["port"]))
-
-
 def main():
+    global BTIME
+    BTIME = btime()
     try:
         uslugi = zbierz()
         print(json.dumps({"ok": True, "uslugi": uslugi,
                           "updatedAt": time.strftime("%H:%M:%S")}, ensure_ascii=False))
-    except Exception as e:  # noqa: BLE001 — paskowa bramka: każda porażka to jawny błąd w JSON
+    except Exception as e:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
         sys.exit(1)
 

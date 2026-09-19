@@ -7,6 +7,7 @@ import qs.Ui
 
 // Lokalne usługi WWW w pasku. Dane robi ~/.local/bin/uslugi-www-stan (JSON),
 // ten plik tylko wyświetla i otwiera URL w przeglądarce.
+// Historia CPU (mini-wykres) trzymamy w pamięci widgetu — ostatnie 12 próbek.
 Panel {
   id: root
   moduleName: "pablo.uslugi"
@@ -15,8 +16,11 @@ Panel {
 
   readonly property string helper: Quickshell.env("HOME") + "/.local/bin/uslugi-www-stan"
   readonly property int refreshSec: Math.max(5, Number(setting("refreshIntervalSec", 15)))
+  readonly property int histMax: 12
 
   property var uslugi: []
+  // port → tablica ostatnich odczytów CPU (liczby albo -1 = brak danych)
+  property var cpuHist: ({})
   property string loadError: ""
   property string updatedAt: ""
 
@@ -37,13 +41,25 @@ Panel {
     return n + " usług"
   }
 
+  function histDla(port) {
+    return root.cpuHist[port] || []
+  }
+
+  function formatUptime(s) {
+    if (s === null || s === undefined) return "—"
+    if (s < 60) return s + " s"
+    if (s < 3600) return Math.floor(s / 60) + " min"
+    if (s < 86400) return Math.floor(s / 3600) + " h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + " min"
+    return Math.floor(s / 86400) + " d " + Math.floor(s % 86400 / 3600) + " h"
+  }
+
   function tooltipText() {
     if (loadError !== "") return "Usługi: " + loadError
     if (uslugi.length === 0) return "Brak lokalnych usług WWW"
     var lines = []
     for (var i = 0; i < uslugi.length; i++) {
       var u = uslugi[i]
-      lines.push(u.nazwa + " · " + u.url + " (" + etykietaZrodla(u.zrodlo) + ")")
+      lines.push(u.nazwa + " (" + u.srodowisko + ") · " + u.url)
     }
     return lines.join("\n")
   }
@@ -59,6 +75,14 @@ Panel {
       loadError = ""
       uslugi = data.uslugi || []
       updatedAt = data.updatedAt || ""
+      var h = {}
+      for (var i = 0; i < uslugi.length; i++) {
+        var u = uslugi[i]
+        var arr = (root.cpuHist[u.port] || []).slice(-(root.histMax - 1))
+        arr.push(u.cpu === null || u.cpu === undefined ? -1 : u.cpu)
+        h[u.port] = arr
+      }
+      cpuHist = h
     } catch (e) {
       loadError = "nieczytelny wynik skryptu"
     }
@@ -161,8 +185,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
+    contentWidth: panel.fittedContentWidth(Style.space(480))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -219,41 +243,87 @@ Panel {
             model: root.uslugi
 
             delegate: Rectangle {
+              id: wiersz
               required property var modelData
               width: parent.width
-              height: row.implicitHeight + Style.space(16)
+              height: wew.implicitHeight + Style.space(16)
               radius: Style.cornerRadius
-              color: mouse.containsMouse ? Qt.lighter(Color.background, 1.15) : Color.background
+              color: mysz.containsMouse ? Qt.lighter(Color.background, 1.15) : Color.background
 
-              Row {
-                id: row
+              Column {
+                id: wew
                 anchors.verticalCenter: parent.verticalCenter
                 leftPadding: Style.space(12)
                 rightPadding: Style.space(12)
-                spacing: Style.space(10)
+                spacing: Style.space(4)
+
+                // nazwa + środowisko (Docker / venv / systemd / usługa systemowa…)
+                Text {
+                  textFormat: Text.RichText
+                  text: wiersz.modelData.nazwa
+                        + "  <span style='color:" + root.dim + "'>· " + wiersz.modelData.srodowisko + "</span>"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
 
                 Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: root.etykietaZrodla(modelData.zrodlo)
-                  color: modelData.zrodlo === "docker" ? root.foreground : root.dim
+                  textFormat: Text.PlainText
+                  text: wiersz.modelData.url
+                        + (wiersz.modelData.tech && wiersz.modelData.tech !== wiersz.modelData.nazwa
+                           ? "  ·  " + wiersz.modelData.tech : "")
+                  color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
 
-                Column {
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
+                // metryki: mini-wykres CPU · RAM · od kiedy — stały rozmiar
+                Row {
+                  spacing: Style.space(10)
+
+                  Row {
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+
+                    Repeater {
+                      model: root.histMax
+
+                      Rectangle {
+                        required property int index
+                        readonly property var hist: root.histDla(wiersz.modelData.port)
+                        readonly property real v: index < hist.length ? Math.max(0, hist[index]) : -1
+                        width: 3
+                        radius: 1
+                        anchors.bottom: parent.bottom
+                        height: v < 0 ? 2 : Math.max(2, Math.min(10, 2 + v / 12))
+                        color: v < 0 ? Qt.lighter(root.dim, 2.5) : (v > 50 ? (root.bar ? root.bar.urgent : Color.urgent) : root.foreground)
+                        opacity: v < 0 ? 0.5 : (0.45 + 0.55 * index / root.histMax)
+                      }
+                    }
+                  }
 
                   Text {
+                    anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
-                    text: modelData.nazwa
-                    color: root.foreground
+                    text: wiersz.modelData.cpu === null ? "CPU —" : "CPU " + wiersz.modelData.cpu + "%"
+                    color: root.dim
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
+                    font.pixelSize: Style.font.caption
                   }
+
                   Text {
+                    anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
-                    text: modelData.url + (modelData.tech && modelData.tech !== modelData.nazwa ? "  ·  " + modelData.tech : "")
+                    text: wiersz.modelData.mem_mb === null ? "" : "RAM " + (wiersz.modelData.mem_mb >= 1024 ? (wiersz.modelData.mem_mb / 1024).toFixed(1) + " GB" : Math.round(wiersz.modelData.mem_mb) + " MB")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: "↑ " + (wiersz.modelData.uptime_s !== null ? formatUptime(wiersz.modelData.uptime_s) : "—")
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -262,11 +332,11 @@ Panel {
               }
 
               MouseArea {
-                id: mouse
+                id: mysz
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.otworz(modelData.url)
+                onClicked: root.otworz(wiersz.modelData.url)
               }
             }
           }
@@ -275,7 +345,7 @@ Panel {
             width: parent.width
             visible: root.uslugi.length > 0
             textFormat: Text.PlainText
-            text: "Klik wiersza otwiera w przeglądarce. Przyjazne nazwy portów: ~/.config/local-www.map"
+            text: "Klik wiersza otwiera w przeglądarce. Nazwy i środowiska portów: ~/.config/local-www.map
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
