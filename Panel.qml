@@ -23,6 +23,35 @@ Panel {
   property var cpuHist: ({})
   property string loadError: ""
   property string updatedAt: ""
+  // sortowanie listy: "name" | "ram" | "cpu"
+  property string sortBy: "cpu"
+
+  readonly property var sortOpcje: [
+    { klucz: "name", etykieta: "Nazwa", klawisz: "n" },
+    { klucz: "cpu", etykieta: "CPU", klawisz: "c" },
+    { klucz: "ram", etykieta: "RAM", klawisz: "m" }
+  ]
+
+  readonly property var posortowane: {
+    var lista = uslugi.slice()
+    var k = sortBy
+    lista.sort(function(a, b) {
+      if (k === "name") return a.nazwa.localeCompare(b.nazwa, "pl")
+      if (k === "ram") return (b.mem_mb || 0) - (a.mem_mb || 0)
+      return (b.cpu || 0) - (a.cpu || 0)
+    })
+    return lista
+  }
+
+  readonly property string podsumowanie: {
+    var cpu = 0, mem = 0
+    for (var i = 0; i < uslugi.length; i++) {
+      cpu += uslugi[i].cpu || 0
+      mem += uslugi[i].mem_mb || 0
+    }
+    var memTxt = mem >= 1024 ? (mem / 1024).toFixed(1) + " GB" : Math.round(mem) + " MB"
+    return ileUslug(uslugi.length) + " · CPU " + cpu.toFixed(1) + "% · RAM " + memTxt
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -196,7 +225,12 @@ Panel {
       onMoveRequested: function(dx, dy) {
         panelFlick.contentY = Math.max(0, Math.min(panelFlick.contentHeight - panelFlick.height, panelFlick.contentY + dy * Style.space(60)))
       }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refresh()
+        else if (t === "n" || t === "N") root.sortBy = "name"
+        else if (t === "c" || t === "C") root.sortBy = "cpu"
+        else if (t === "m" || t === "M") root.sortBy = "ram"
+      }
 
       Flickable {
         id: panelFlick
@@ -218,7 +252,7 @@ Panel {
             title: "Usługi WWW"
             meta: root.loadError !== "" ? root.loadError
               : (root.uslugi.length === 0 ? "brak nasłuchujących usług"
-                 : ileUslug(root.uslugi.length) + " · odświeżono " + root.updatedAt)
+                 : root.podsumowanie + " · " + root.updatedAt)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -239,8 +273,56 @@ Panel {
             }
           }
 
+          // sortowanie: Nazwa / CPU / RAM
+          Row {
+            width: parent.width
+            spacing: Style.space(10)
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "Sortuj:"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Repeater {
+              model: root.sortOpcje
+
+              delegate: Text {
+                required property var modelData
+                readonly property bool aktywny: root.sortBy === modelData.klucz
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: modelData.etykieta
+                color: aktywny ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.underline: aktywny
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.sortBy = parent.modelData.klucz
+                }
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "(klawisze n / c / m)"
+              color: root.dim
+              opacity: 0.7
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
           Repeater {
-            model: root.uslugi
+            model: root.posortowane
 
             delegate: Rectangle {
               id: wiersz
@@ -345,7 +427,7 @@ Panel {
             width: parent.width
             visible: root.uslugi.length > 0
             textFormat: Text.PlainText
-            text: "Klik wiersza otwiera w przeglądarce. Nazwy i środowiska portów: ~/.config/local-www.map
+            text: "Klik wiersza otwiera w przeglądarce. Nazwy i środowiska portów: ~/.config/local-www.map"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
