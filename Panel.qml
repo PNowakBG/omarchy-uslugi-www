@@ -25,6 +25,11 @@ Panel {
   property string updatedAt: ""
   // sortowanie listy: "name" | "ram" | "cpu"
   property string sortBy: "cpu"
+  // widok: "full" (wszystko) | "compact" (jedna linijka na usługę);
+  // nadpisWidoku = chwilowy przełącznik w panelu, baza = ustawienie widgetu
+  property var nadpisWidoku: null
+  readonly property bool kompakt: (nadpisWidoku !== null ? nadpisWidoku
+                                   : String(setting("display", "full"))) === "compact"
 
   // ── i18n: język z LANG systemu (pl_* → polski, reszta → angielski) ──────
   readonly property string langOpcja: String(setting("language", "auto")).toLowerCase()
@@ -262,6 +267,7 @@ Panel {
         else if (t === "n" || t === "N") root.sortBy = "name"
         else if (t === "c" || t === "C") root.sortBy = "cpu"
         else if (t === "m" || t === "M") root.sortBy = "ram"
+        else if (t === "d" || t === "D") root.nadpisWidoku = root.kompakt ? "full" : "compact"
       }
 
       Flickable {
@@ -345,6 +351,24 @@ Panel {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
+              text: root.kompakt ? i18n("Zwięzły", "Compact") : i18n("Pełny", "Detailed")
+              color: root.foreground
+              opacity: 0.85
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.underline: true
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.nadpisWidoku = root.kompakt ? "full" : "compact"
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
               text: i18n("(klawisze n / c / m)", "(keys n / c / m)")
               color: root.dim
               opacity: 0.7
@@ -360,7 +384,7 @@ Panel {
               id: wiersz
               required property var modelData
               width: parent.width
-              height: wew.implicitHeight + Style.space(16)
+              height: wew.implicitHeight + Style.space(root.kompakt ? 8 : 16)
               radius: Style.cornerRadius
               color: mysz.containsMouse ? Qt.lighter(Color.background, 1.15) : Color.background
 
@@ -369,7 +393,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 leftPadding: Style.space(12)
                 rightPadding: Style.space(12)
-                spacing: Style.space(4)
+                spacing: root.kompakt ? Style.space(2) : Style.space(4)
 
                 // nazwa + środowisko (Docker / background service / venv…)
                 Text {
@@ -382,6 +406,7 @@ Panel {
                 }
 
                 Text {
+                  visible: !root.kompakt
                   textFormat: Text.PlainText
                   text: wiersz.modelData.url
                         + (wiersz.modelData.tech && root.tTech(wiersz.modelData.tech, wiersz.modelData.tech_param) !== wiersz.modelData.nazwa
@@ -396,6 +421,7 @@ Panel {
                   spacing: Style.space(10)
 
                   Row {
+                    visible: !root.kompakt
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: 2
 
@@ -417,6 +443,7 @@ Panel {
                   }
 
                   Text {
+                    visible: !root.kompakt
                     anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
                     text: wiersz.modelData.cpu === null ? "CPU —" : "CPU " + wiersz.modelData.cpu + "%"

@@ -72,6 +72,14 @@ reszty. Wymuszenie: ustawienia widgetu → **Language** → `pl` / `en` / `auto`
 Etykiety środowisk (Docker, usługa w tle, background service…) tłumaczy
 warstwa QML — skaner zwraca neutralne klucze.
 
+## Widok: pełny albo zwięzły (compact)
+
+Przełącznik **Compact / Detailed** obok sortowania (albo klawisz `d`,
+albo ustawienie widgetu `display` = `full`/`compact`). Zwięzły pokazuje
+jedną linijkę na usługę: nazwa · środowisko · RAM · uptime — wszystkie
+wpisy mieszczą się bez przewijania. Pełny dodaje URL, szczegół technologii
+i mini-wykres CPU.
+
 ## Pliki
 
 - `manifest.json` — manifest wtyczki (id `pablo.uslugi`, bar-widget),

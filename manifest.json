@@ -19,7 +19,8 @@
     "defaultSection": "left",
     "defaults": {
       "refreshIntervalSec": 15,
-      "language": "auto"
+      "language": "auto",
+      "display": "full"
     },
     "schema": [
       {
@@ -36,6 +37,12 @@
         "type": "string",
         "label": "Language / Język",
         "defaultValue": "auto"
+      },
+      {
+        "key": "display",
+        "type": "string",
+        "label": "Display / Widok (full|compact)",
+        "defaultValue": "full"
       }
     ]
   }
