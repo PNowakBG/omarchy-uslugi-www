@@ -253,7 +253,7 @@ Panel {
                   }
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.url
+                    text: modelData.url + (modelData.tech && modelData.tech !== modelData.nazwa ? "  ·  " + modelData.tech : "")
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption

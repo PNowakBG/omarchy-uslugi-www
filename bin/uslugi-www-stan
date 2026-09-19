@@ -66,16 +66,20 @@ def uruchom(argv):
 
 
 def kontenery():
-    """docker ps → [(nazwa, host_adres, port)], zrodlo=docker."""
+    """docker ps → [(nazwa, host_adres, port, tech)], zrodlo=docker."""
     wynik = []
-    out = uruchom(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"])
+    out = uruchom(["docker", "ps", "--format",
+                   "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Ports}}"])
     for linia in out.splitlines():
-        czesci = linia.split("\t", 1)
-        if len(czesci) != 2:
+        czesci = linia.split("\t", 2)
+        if len(czesci) != 3:
             continue
-        nazwa, porty = czesci
+        nazwa, compose, porty = czesci
+        tech = "docker"
+        if compose:
+            tech = f"docker compose: {compose}"
         for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
-            wynik.append((nazwa, m.group(1), int(m.group(2))))
+            wynik.append((nazwa, m.group(1), int(m.group(2)), tech))
     return wynik
 
 
@@ -103,15 +107,20 @@ def gniazda():
     return wynik
 
 
-def zrodlo_procesu(pid):
-    """'venv', gdy cmdline procesu wskazuje na środowisko venv, inaczej 'proces'."""
+def cmdline_tekst(pid):
+    """Cmdline procesu jako tekst. Chromium i inne setproctitle'owe programy
+    przepisują argv w jeden string ze spacjami — split po NUL by mylił."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmdline = f.read().decode("utf-8", "replace").split("\0")
-        if any("venv" in cz for cz in cmdline):
-            return "venv"
+            return f.read().decode("utf-8", "replace").replace("\0", " ")
     except OSError:
-        pass
+        return ""
+
+
+def zrodlo_procesu(pid):
+    """'venv', gdy cmdline procesu wskazuje na środowisko venv, inaczej 'proces'."""
+    if "venv" in cmdline_tekst(pid):
+        return "venv"
     return "proces"
 
 
@@ -122,37 +131,48 @@ def nazwa_procesu(pid, proces):
     nazwę bierzemy z katalogu profilu (--user-data-dir), np.
     ~/.hermes/lv-browser-profile → „lv-browser" (bez „-profile").
     """
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            czesci = [c.decode("utf-8", "replace")
-                      for c in f.read().split(b"\0") if c]
-    except OSError:
+    cmd = cmdline_tekst(pid)
+    if "--remote-debugging-port" not in cmd:
         return proces
-    if "--remote-debugging-port" not in czesci:
-        return proces
-    katalog = None
-    for i, c in enumerate(czesci):
-        if c == "--user-data-dir" and i + 1 < len(czesci):
-            katalog = czesci[i + 1]
-        elif c.startswith("--user-data-dir="):
-            katalog = c.split("=", 1)[1]
-    if not katalog:
+    m = re.search(r"--user-data-dir[=\s](\S+)", cmd)
+    if not m:
         return proces + "-devtools"
-    profil = os.path.basename(katalog.rstrip("/"))
+    profil = os.path.basename(m.group(1).rstrip("/"))
     if profil.endswith("-profile"):
         profil = profil[: -len("-profile")]
     return profil or proces + "-devtools"
 
 
+def tech_procesu(pid, proces):
+    """Technologia uruchomienia: unit systemd, venv, devtools albo binarka."""
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
+            cgroup = f.read()
+    except OSError:
+        cgroup = ""
+    m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cgroup)
+    if m:
+        unit = m.group(1)
+        czy_user = "user@" in cgroup or "/app.slice/" in cgroup
+        return f"systemd: {unit}" + (" (--user)" if czy_user else "")
+    if zrodlo_procesu(pid) == "venv":
+        return "venv"
+    cmd = cmdline_tekst(pid)
+    if "--remote-debugging-port" in cmd:
+        return f"devtools ({proces})"
+    return proces
+
+
 def zbierz():
     nazwy = przyjazne_nazwy()
     uslugi = {}
-    for nazwa, adres, port in kontenery():
+    for nazwa, adres, port, tech in kontenery():
         uslugi[port] = {
             "nazwa": nazwa,
             "url": f"http://{host_url(adres)}:{port}",
             "port": port,
             "zrodlo": "docker",
+            "tech": tech,
             "adres": host_url(adres),
         }
     for adres, port, proces, pid in gniazda():
@@ -171,6 +191,7 @@ def zbierz():
                 "url": f"http://{host_url(adres)}:{port}",
                 "port": port,
                 "zrodlo": "system",
+                "tech": "usługa systemowa (root)",
                 "adres": host_url(adres),
             }
             continue
@@ -179,6 +200,7 @@ def zbierz():
             "url": f"http://{host_url(adres)}:{port}",
             "port": port,
             "zrodlo": zrodlo_procesu(pid),
+            "tech": tech_procesu(pid, proces),
             "adres": host_url(adres),
         }
     return sorted(uslugi.values(), key=lambda u: (u["zrodlo"] != "docker", u["port"]))
