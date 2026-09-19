@@ -10,7 +10,7 @@
 #     gdy w cmdline procesu jest "venv", inaczej "proces"
 # Gniazda bez procesu (cudze/root), porty systemowe (dns, cups itd.) i
 # docker-proxy (już objęte wpisem kontenera) są pomijane.
-# Przyjazne nazwy: ~/.config/uslugi-www.map (linie "port nazwa"), wbudowane
+# Przyjazne nazwy: ~/.config/local-www.map (linie "port nazwa"), wbudowane
 # domyślne dla portów Goseka. Wpis "port !" UKRYWA port. Gniazda bez widocznego
 # procesu (usługi roota, np. minio) pokażą się TYLKO gdy port jest w mapie —
 # wtedy zrodlo="system".
@@ -35,15 +35,16 @@ DOMYSLNE_NAZWY = {8787: "gosek-panel"}
 def przyjazne_nazwy():
     """port → nazwa; '!' znaczy „ukryj port”. Nazwy z pliku nadpisują domyślne."""
     nazwy = dict(DOMYSLNE_NAZWY)
-    plik = os.path.expanduser("~/.config/uslugi-www.map")
-    try:
-        with open(plik, encoding="utf-8") as f:
-            for linia in f:
-                czesci = linia.split(None, 1)
-                if len(czesci) == 2 and czesci[0].isdigit():
-                    nazwy[int(czesci[0])] = czesci[1].strip()
-    except OSError:
-        pass
+    for plik in (os.path.expanduser("~/.config/local-www.map"),
+                 os.path.expanduser("~/.config/local-www.map")):  # stara nazwa
+        try:
+            with open(plik, encoding="utf-8") as f:
+                for linia in f:
+                    czesci = linia.split(None, 1)
+                    if len(czesci) == 2 and czesci[0].isdigit():
+                        nazwy[int(czesci[0])] = czesci[1].strip()
+        except OSError:
+            continue
     return nazwy
 
 

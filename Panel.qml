@@ -275,7 +275,7 @@ Panel {
             width: parent.width
             visible: root.uslugi.length > 0
             textFormat: Text.PlainText
-            text: "Klik wiersza otwiera w przeglądarce. Przyjazne nazwy portów: ~/.config/uslugi-www.map"
+            text: "Klik wiersza otwiera w przeglądarce. Przyjazne nazwy portów: ~/.config/local-www.map"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

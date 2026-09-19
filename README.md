@@ -38,7 +38,7 @@ Helper `bin/uslugi-www-stan status` (python3, stdlib) scala dwa źródła:
 
 Porty systemowe (DNS 53, CUPS 631, Sunshine 47984–48010, SSH…) są pomijane.
 
-## Przyjazne nazwy i ukrywanie: `~/.config/uslugi-www.map`
+## Przyjazne nazwy i ukrywanie: `~/.config/local-www.map`
 
 ```text
 # port nazwa        → port pokazywany pod tą nazwą (nadpisuje nazwę procesu)
