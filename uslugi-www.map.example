@@ -1,0 +1,10 @@
+# Przyjazne nazwy portów dla widgetu „Usługi WWW" (pablo.uslugi).
+# Format:  port nazwa          → port pokazywany pod tą nazwą
+#          port !              → port ukryty
+# Porty usług roota/systemowych (bez widocznego procesu) pokazują się
+# WYŁĄCZNIE, gdy są tu zadeklarowane (etykieta „system").
+9000 minio-s3
+9001 minio-konsola
+# Przeglądarka automatyzacji LasVegas (DevTools, profil ~/.hermes/lv-browser-profile)
+9222 lasvegas
+
