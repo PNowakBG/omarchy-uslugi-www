@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "pablo.uslugi",
-  "name": "Usługi WWW",
+  "name": "Local Web Services",
   "version": "1.0.0",
   "author": "pablo",
-  "description": "Lokalne usługi WWW (docker i procesy): adresy i porty, klik otwiera w przeglądarce.",
+  "description": "Local web services (Docker/venv/system services) with ports, CPU/RAM, uptime — click opens the browser. PL/EN auto.",
   "kinds": [
     "bar-widget"
   ],
@@ -12,13 +12,14 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Usługi WWW",
-    "description": "Nasłuchujące lokalne serwisy WWW z dockera i procesów; klik = otwórz w przeglądarce.",
+    "displayName": "Local Web Services",
+    "description": "Listening local web services from Docker, processes and system services; click to open in browser.",
     "category": "Development",
     "allowMultiple": false,
     "defaultSection": "left",
     "defaults": {
-      "refreshIntervalSec": 15
+      "refreshIntervalSec": 15,
+      "language": "auto"
     },
     "schema": [
       {
@@ -29,6 +30,12 @@
         "max": 300,
         "step": 5,
         "defaultValue": 15
+      },
+      {
+        "key": "language",
+        "type": "string",
+        "label": "Language / Język",
+        "defaultValue": "auto"
       }
     ]
   }

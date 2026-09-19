@@ -65,6 +65,13 @@ Przeglądarki z `--remote-debugging-port` dostają nazwę z katalogu profilu
 |---|---|---|
 | `refreshIntervalSec` | 15 | co ile sekund skanować (min. 5) |
 
+## Język / Language
+
+Widget mówi językiem systemu (od `LANG`): polski dla `pl_*`, angielski dla
+reszty. Wymuszenie: ustawienia widgetu → **Language** → `pl` / `en` / `auto`.
+Etykiety środowisk (Docker, usługa w tle, background service…) tłumaczy
+warstwa QML — skaner zwraca neutralne klucze.
+
 ## Pliki
 
 - `manifest.json` — manifest wtyczki (id `pablo.uslugi`, bar-widget),

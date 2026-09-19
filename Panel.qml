@@ -6,7 +6,7 @@ import qs.Commons
 import qs.Ui
 
 // Lokalne usługi WWW w pasku. Dane robi ~/.local/bin/uslugi-www-stan (JSON),
-// ten plik tylko wyświetla i otwiera URL w przeglądarce.
+// ten plik tłumaczy klucze na język systemu (PL/EN) i otwiera URL-e.
 // Historia CPU (mini-wykres) trzymamy w pamięci widgetu — ostatnie 12 próbek.
 Panel {
   id: root
@@ -26,8 +26,65 @@ Panel {
   // sortowanie listy: "name" | "ram" | "cpu"
   property string sortBy: "cpu"
 
+  // ── i18n: język z LANG systemu (pl_* → polski, reszta → angielski) ──────
+  readonly property string langOpcja: String(setting("language", "auto")).toLowerCase()
+  readonly property string lang: langOpcja === "pl" || langOpcja === "en"
+    ? langOpcja
+    : ((Quickshell.env("LANG") || "en").toLowerCase().startsWith("pl") ? "pl" : "en")
+  function i18n(pl, en) { return root.lang === "pl" ? pl : en }
+
+  readonly property var slownikSrodowisk: ({
+    "docker":      { pl: "Docker",             en: "Docker" },
+    "kubernetes":  { pl: "Kubernetes",         en: "Kubernetes" },
+    "podman":      { pl: "Podman",             en: "Podman" },
+    "service":     { pl: "usługa w tle",       en: "background service" },
+    "root-service":{ pl: "usługa systemowa",   en: "system service" },
+    "venv":        { pl: "venv",               en: "Python venv" },
+    "devtools":    { pl: "devtools",           en: "automation browser" },
+    "flatpak":     { pl: "Flatpak",            en: "Flatpak" },
+    "snap":        { pl: "Snap",               en: "Snap" },
+    "appimage":    { pl: "AppImage",           en: "AppImage" },
+    "vm":          { pl: "maszyna wirtualna",  en: "virtual machine" },
+    "lxc":         { pl: "kontener LXC",       en: "LXC container" },
+    "java":        { pl: "aplikacja Java",     en: "Java app" },
+    "node":        { pl: "Node.js",            en: "Node.js" },
+    "python":      { pl: "Python",             en: "Python" },
+    "process":     { pl: "proces lokalny",     en: "local process" }
+  })
+
+  function tSrod(klucz) {
+    var wpis = root.slownikSrodowisk[klucz]
+    return wpis ? wpis[root.lang] : klucz  // nadpisy z mapy pokazujemy dosłownie
+  }
+
+  function tTech(klucz, param) {
+    if (klucz === "compose") return i18n("docker compose: ", "docker compose: ") + param
+    if (klucz === "docker") return "Docker"
+    if (klucz === "root-service") return i18n("usługa systemowa (root)", "system service (root)")
+    if (klucz === "devtools-browser") return i18n("devtools (przeglądarka)", "automation browser")
+    if (klucz === "exe") return param
+    return param || klucz
+  }
+
+  function ileUslug(n) {
+    if (root.lang === "pl") {
+      if (n === 1) return "1 usługa"
+      if (n >= 2 && n <= 4) return n + " usługi"
+      return n + " usług"
+    }
+    return n === 1 ? "1 service" : n + " services"
+  }
+
+  function formatUptime(s) {
+    if (s === null || s === undefined) return "—"
+    if (s < 60) return s + " s"
+    if (s < 3600) return Math.floor(s / 60) + " min"
+    if (s < 86400) return Math.floor(s / 3600) + " h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + " min"
+    return Math.floor(s / 86400) + " d " + Math.floor(s % 86400 / 3600) + " h"
+  }
+
   readonly property var sortOpcje: [
-    { klucz: "name", etykieta: "Nazwa", klawisz: "n" },
+    { klucz: "name", etykieta: i18n("Nazwa", "Name"), klawisz: "n" },
     { klucz: "cpu", etykieta: "CPU", klawisz: "c" },
     { klucz: "ram", etykieta: "RAM", klawisz: "m" }
   ]
@@ -53,42 +110,17 @@ Panel {
     return ileUslug(uslugi.length) + " · CPU " + cpu.toFixed(1) + "% · RAM " + memTxt
   }
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-
-  function etykietaZrodla(z) {
-    if (z === "docker") return "docker"
-    if (z === "venv") return "venv"
-    if (z === "system") return "system"
-    return "proces"
-  }
-
-  function ileUslug(n) {
-    if (n === 1) return "1 usługa"
-    if (n >= 2 && n <= 4) return n + " usługi"
-    return n + " usług"
-  }
-
   function histDla(port) {
     return root.cpuHist[port] || []
   }
 
-  function formatUptime(s) {
-    if (s === null || s === undefined) return "—"
-    if (s < 60) return s + " s"
-    if (s < 3600) return Math.floor(s / 60) + " min"
-    if (s < 86400) return Math.floor(s / 3600) + " h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + " min"
-    return Math.floor(s / 86400) + " d " + Math.floor(s % 86400 / 3600) + " h"
-  }
-
   function tooltipText() {
-    if (loadError !== "") return "Usługi: " + loadError
-    if (uslugi.length === 0) return "Brak lokalnych usług WWW"
+    if (loadError !== "") return i18n("Usługi: ", "Services: ") + loadError
+    if (uslugi.length === 0) return i18n("Brak lokalnych usług WWW", "No local web services")
     var lines = []
     for (var i = 0; i < uslugi.length; i++) {
       var u = uslugi[i]
-      lines.push(u.nazwa + " (" + u.srodowisko + ") · " + u.url)
+      lines.push(u.nazwa + " (" + tSrod(u.srodowisko) + ") · " + u.url)
     }
     return lines.join("\n")
   }
@@ -100,7 +132,7 @@ Panel {
   function applyStatus(text) {
     try {
       var data = JSON.parse(text)
-      if (!data.ok) { loadError = data.error || "błąd"; return }
+      if (!data.ok) { loadError = data.error || "error"; return }
       loadError = ""
       uslugi = data.uslugi || []
       updatedAt = data.updatedAt || ""
@@ -113,7 +145,7 @@ Panel {
       }
       cpuHist = h
     } catch (e) {
-      loadError = "nieczytelny wynik skryptu"
+      loadError = i18n("nieczytelny wynik skryptu", "unreadable script output")
     }
   }
 
@@ -249,9 +281,9 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: "Usługi WWW"
+            title: i18n("Usługi WWW", "Local Web Services")
             meta: root.loadError !== "" ? root.loadError
-              : (root.uslugi.length === 0 ? "brak nasłuchujących usług"
+              : (root.uslugi.length === 0 ? i18n("brak nasłuchujących usług", "no listening services")
                  : root.podsumowanie + " · " + root.updatedAt)
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -266,7 +298,7 @@ Panel {
             trailingControl: Component {
               PanelActionButton {
                 iconText: "󰑐"
-                tooltipText: "Odśwież (r)"
+                tooltipText: i18n("Odśwież (r)", "Refresh (r)")
                 foreground: root.foreground
                 onClicked: root.refresh()
               }
@@ -281,7 +313,7 @@ Panel {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: "Sortuj:"
+              text: i18n("Sortuj:", "Sort:")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -313,7 +345,7 @@ Panel {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: "(klawisze n / c / m)"
+              text: i18n("(klawisze n / c / m)", "(keys n / c / m)")
               color: root.dim
               opacity: 0.7
               font.family: root.fontFamily
@@ -339,11 +371,11 @@ Panel {
                 rightPadding: Style.space(12)
                 spacing: Style.space(4)
 
-                // nazwa + środowisko (Docker / venv / systemd / usługa systemowa…)
+                // nazwa + środowisko (Docker / background service / venv…)
                 Text {
                   textFormat: Text.RichText
                   text: wiersz.modelData.nazwa
-                        + "  <span style='color:" + root.dim + "'>· " + wiersz.modelData.srodowisko + "</span>"
+                        + "  <span style='color:" + root.dim + "'>· " + root.tSrod(wiersz.modelData.srodowisko) + "</span>"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -352,8 +384,8 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: wiersz.modelData.url
-                        + (wiersz.modelData.tech && wiersz.modelData.tech !== wiersz.modelData.nazwa
-                           ? "  ·  " + wiersz.modelData.tech : "")
+                        + (wiersz.modelData.tech && root.tTech(wiersz.modelData.tech, wiersz.modelData.tech_param) !== wiersz.modelData.nazwa
+                           ? "  ·  " + root.tTech(wiersz.modelData.tech, wiersz.modelData.tech_param) : "")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -405,7 +437,7 @@ Panel {
                   Text {
                     anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
-                    text: "↑ " + (wiersz.modelData.uptime_s !== null ? formatUptime(wiersz.modelData.uptime_s) : "—")
+                    text: "↑ " + formatUptime(wiersz.modelData.uptime_s)
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -427,7 +459,8 @@ Panel {
             width: parent.width
             visible: root.uslugi.length > 0
             textFormat: Text.PlainText
-            text: "Klik wiersza otwiera w przeglądarce. Nazwy i środowiska portów: ~/.config/local-www.map"
+            text: i18n("Klik wiersza otwiera w przeglądarce. Nazwy i środowiska portów: ~/.config/local-www.map",
+                    "Click a row to open it in the browser. Friendly port names: ~/.config/local-www.map")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

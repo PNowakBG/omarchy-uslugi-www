@@ -148,28 +148,30 @@ def format_uptime(s):
 # ── środowisko ──────────────────────────────────────────────────────────────
 
 def srodowisko_procesu(pid):
-    """Zrozumiała odpowiedź: W CZYM działa usługa."""
+    """Klucz środowiska (tłumaczy dopiero warstwa QML):
+    kubernetes | podman | vm | lxc | service | flatpak | snap | appimage |
+    docker | venv | devtools | java | node | python | process."""
     cg = cgroup_tekst(pid)
     if "kubepods" in cg:
-        return "Kubernetes"
+        return "kubernetes"
     if "libpod" in cg or "podman" in cg:
-        return "Podman"
+        return "podman"
     if "machine.slice" in cg:
-        return "maszyna wirtualna"
+        return "vm"
     if "lxc.payload" in cg:
-        return "kontener LXC"
+        return "lxc"
     m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cg)
     if m:
-        return "usługa w tle"
+        return "service"
     if os.path.exists(f"/proc/{pid}/root/.flatpak-info"):
-        return "Flatpak"
+        return "flatpak"
     cmd = cmdline_tekst(pid)
     if "/snap/" in cmd:
-        return "Snap"
+        return "snap"
     if ".AppImage" in cmd:
-        return "AppImage"
+        return "appimage"
     if "deploy/docker" in cmd:
-        return "Docker"
+        return "docker"
     if "venv" in cmd:
         return "venv"
     if "--remote-debugging-port" in cmd:
@@ -181,12 +183,12 @@ def srodowisko_procesu(pid):
     except (OSError, IndexError):
         pass
     if exe == "java":
-        return "aplikacja Java"
+        return "java"
     if exe == "node" or re.search(r"\b(npm|vite|next|npx) ", cmd):
-        return "Node.js"
+        return "node"
     if exe.startswith("python") or re.search(r"\b(uvicorn|gunicorn|flask) ", cmd):
-        return "Python"
-    return "proces lokalny"
+        return "python"
+    return "process"
 
 
 def environ_tekst(pid):
@@ -232,7 +234,7 @@ def kontenery():
             except ValueError:
                 pass
             pid = int(cz[1]) if cz[1].isdigit() else None
-        tech = "docker" + (f" compose: {compose}" if compose else "")
+        tech = ("compose", compose) if compose else ("docker", "")
         for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
             wynik.append((nazwa, m.group(1), int(m.group(2)), "Docker", tech, pid, start_s))
     return wynik
@@ -260,14 +262,14 @@ def gniazda():
 def nazwa_z_profilu(pid, proces):
     cmd = cmdline_tekst(pid)
     if "--remote-debugging-port" not in cmd:
-        return proces, proces
+        return proces, ("exe", proces)
     m = re.search(r"--user-data-dir[=\s](\S+)", cmd)
     if not m:
-        return proces + "-devtools", "devtools (przeglądarka)"
+        return proces + "-devtools", ("devtools-browser", "")
     profil = os.path.basename(m.group(1).rstrip("/"))
     if profil.endswith("-profile"):
         profil = profil[: -len("-profile")]
-    return (profil or proces + "-devtools"), "devtools (przeglądarka)"
+    return (profil or proces + "-devtools"), ("devtools-browser", "")
 
 
 def zbierz():
@@ -282,9 +284,10 @@ def zbierz():
             cpu, mem, up = metryki(pid, stan_proc, teraz)
         elif start_s:
             up = start_s
+        tech_k, tech_p = tech if isinstance(tech, tuple) else (tech, "")
         uslugi[port] = {
             "nazwa": nazwa, "url": f"http://{host_url(adres)}:{port}", "port": port,
-            "zrodlo": zrodlo, "srodowisko": srod, "tech": tech,
+            "zrodlo": zrodlo, "srodowisko": srod, "tech": tech_k, "tech_param": tech_p,
             "cpu": cpu, "mem_mb": mem, "uptime_s": up, "adres": host_url(adres),
         }
 
@@ -307,8 +310,8 @@ def zbierz():
             nazwa = deklaracja[0]
             jednostka = deklaracja[1] if len(deklaracja) > 1 and deklaracja[1].endswith(".service") else None
             pid = pid_po_jednostce(jednostka)
-            tech = "usługa systemowa (root)"
-            srod = ("usługa w tle" if pid else "usługa systemowa")
+            tech = ("root-service", "")
+            srod = "service" if pid else "root-service"
             wstaw(port, nazwa, adres, "system", srod, tech, pid, None, stan)
             continue
         nazwa_auto, tech = nazwa_z_profilu(pid, proces)
