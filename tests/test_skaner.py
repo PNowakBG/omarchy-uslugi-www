@@ -280,6 +280,14 @@ class HistoriaICacheOdporne(unittest.TestCase):
         self.assertEqual(list(S.czysc_historie(hist)), ["c"])
         self.assertEqual(S.czysc_cache({"1": [float("nan"), 1.0], "2": [1, 2.0]}), {"2": [1, 2.0]})
 
+    def test_gigantyczne_liczby_odrzucone(self):
+        wielka = 10 ** 400   # nie mieści się w float — nie może wywrócić skanu
+        hist = {"a": {"od": wielka, "start": 2, "widziana": 3},
+                "b": {"od": 1, "start": 2, "widziana": 3, "restarty": 10 ** 20},
+                "c": {"od": 1, "start": 2, "widziana": 3}}
+        self.assertEqual(list(S.czysc_historie(hist)), ["c"])
+        self.assertEqual(S.czysc_cache({"1": [wielka, 2.0], "2": [1, 2.0]}), {"2": [1, 2.0]})
+
 
 class Gniazda(unittest.TestCase):
     def test_prefork_bierze_najstarszy_proces(self):

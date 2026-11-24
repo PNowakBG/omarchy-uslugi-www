@@ -1301,8 +1301,14 @@ def zbierz():
 
 
 def _liczba(v):
-    """Skończona liczba (NaN/Infinity z ręcznej edycji pliku też odpadają)."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """Rozsądna liczba: skończona i w zakresie (czas epoch, takty, liczniki).
+    NaN/Infinity i gigantyczne liczby z ręcznej edycji pliku odpadają."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(v) and abs(v) < 1e15
+    except OverflowError:   # int większy niż zakres float
+        return False
 
 
 def czysc_cache(stan):
