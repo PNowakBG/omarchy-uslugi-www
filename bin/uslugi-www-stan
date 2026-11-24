@@ -1,33 +1,197 @@
 #!/usr/bin/env python3
 # uslugi-www-stan — wykrywa lokalne usługi WWW (docker, procesy, usługi
 # systemowe) i opisuje je językiem zrozumiałym dla nietechników:
-# w CZYM działają (Docker / venv / Kubernetes / systemd), od kiedy chodzą
-# i ile zużywają CPU i RAM.
+# w CZYM działają (Docker / venv / Kubernetes / systemd), KTO je wystawił
+# (agent kodujący, terminal, systemd, Docker), czy to usługa STAŁA czy TEST
+# agenta, od kiedy jest wystawiona, kiedy był ostatni restart, ile zużywa
+# CPU i RAM.
 #
-#   uslugi-www-stan status          → {"ok":true,"uslugi":[...],"updatedAt":...}
+#   uslugi-www-stan status                 → {"ok":true,"uslugi":[...],"updatedAt":...}
+#   uslugi-www-stan nazwa KLUCZ [NAZWA…]   → własna nazwa usługi (pusta = automatyczna)
+#   uslugi-www-stan kolor KLUCZ [KOLOR]    → kolor usługi z palety KOLORY (pusty = bez koloru)
 #
-# Jedna usługa:
-#   nazwa, url, port, zrodlo (docker|system|venv|proces),
-#   srodowisko (Docker|Kubernetes|venv|systemd|usługa systemowa|proces),
-#   tech (szczegół dla dociekliwych), cpu (%), mem_mb, uptime_s.
+# Jedna usługa (pola stare zostają bez zmian):
+#   nazwa, url, port, zrodlo (docker|system|venv|proces), srodowisko, tech,
+#   tech_param, cpu (%), mem_mb, uptime_s, adres
+# Pola nowe:
+#   klucz        stabilny identyfikator (nazwy, kolory i historia)
+#   nazwa_auto   nazwa, którą usługa miałaby bez nazwy własnej
+#   nazwa_wlasna czy nazwę nadał użytkownik
+#   kolor        kolor nadany przez użytkownika ('' = brak)
+#   rodzaj       stala | test | reczna | narzedzie | nieznana
+#   powody       [[klucz, parametr], …] — dlaczego taki rodzaj (tłumaczy QML)
+#   kto          {agent, gospodarz, jednostka, menedzer, compose, projekt, uzytkownik}
+#   od           epoch: od kiedy usługa jest wystawiona (najwcześniejszy ślad)
+#   start        epoch: ostatni start (restart)
+#   restarty     ile restartów zauważono od „od”
+#   sam_wstaje   czy wstanie sama po restarcie komputera
+#   osierocona   czy folder, z którego ją uruchomiono, już nie istnieje
+#
+# Rozpoznawanie jest uniwersalne — nie zakłada konkretnego terminala ani
+# menedżera agentów (herdr, Rex, T3 Code, tmux, Zellij, zwykły terminal…):
+#   1. cały łańcuch rodziców procesu: najbliższy znany agent kodujący, powłoka,
+#      a nad nimi pierwszy „prawdziwy” program (gospodarz) — powłoki
+#      i uruchamiacze (node, npm, uv…) są pomijane, nieznany program pośredni
+#      (np. przeładowywacz serwera) nie przerywa szukania agenta,
+#   2. gdy łańcuch jest zerwany (nohup, setsid, demon) — grupa systemd, z której
+#      procesu nie da się wypiąć, i ślady w zmiennych środowiskowych: NAZWY
+#      zmiennych sesji agenta (CLAUDECODE, <AGENT>_SESSION_ID, …) i terminala;
+#      z wartości patrzymy tylko na TERM_PROGRAM i AI_AGENT (nazwa terminala /
+#      agenta, skrócona) oraz czy któraś ścieżka zawiera „deploy/docker”;
+#      żadna inna wartość nie trafia do wyniku; zmienne ustawione dla całej
+#      sesji (systemctl --user show-environment) są pomijane,
+#   3. jednostka systemd: usługa jest „jej” tylko, gdy to główny proces
+#      jednostki albo jego dziecko bez terminala i bez agenta; jednostki-
+#      pojemniki (sesja Hyprland, serwer tmux/foot, aplikacje pulpitu) nie
+#      czynią usługi stałą,
+#   4. folder roboczy: repozytorium git, worktree, folder usunięty
+#      („(deleted)” od jądra) — klucz usługi bierze się z korzenia folderu,
+#      więc nazwa i kolor przetrwają usunięcie worktree.
+# Własne agenty dopisuje się w ~/.config/uslugi-www/agenci.conf
+# (linia: `nazwa_procesu Nazwa Wyświetlana`).
 #
 # CPU liczymy z różnicy taktów /proc/PID/stat między odświeżeniami
 # (stan w ~/.cache/uslugi-www-stan.json). Metryki kontenerów bierzemy
 # z pidu głównego procesu kontenera (docker inspect .State.Pid).
 
+import calendar
+import datetime
+import hashlib
 import json
+import math
 import os
+import pwd
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
 
 POMIJAJ_PORTY = {53, 22, 111, 631, 5353, 5900, 1716, 47984, 47989, 47990, 48010, 6000}
 POMIJAJ_PROCESY = {"docker-proxy", "dockerd", "systemd", "sshd", "cupsd"}
 DOMYSLNE_NAZWY = {8787: "gosek-panel"}
-CACHE = os.path.expanduser("~/.cache/uslugi-www-stan.json")
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(HOME, ".cache", "uslugi-www-stan.json")
+STAN_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "uslugi-www")
+HISTORIA = os.path.join(STAN_DIR, "historia.json")
+KONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "uslugi-www")
+USTAWIENIA_PLIK = os.path.join(KONFIG_DIR, "uslugi.json")   # nazwy i kolory nadane w panelu
+# Paleta kolorów do oznaczania usług (wartości RGB ustala warstwa QML).
+KOLORY = ("czerwony", "pomaranczowy", "zolty", "zielony", "turkusowy",
+          "niebieski", "fioletowy", "rozowy", "szary")
+AGENCI_PLIK = os.path.join(KONFIG_DIR, "agenci.conf")
 HZ = os.sysconf("SC_CLK_TCK")
 STRONA = os.sysconf("SC_PAGE_SIZE")
+BTIME = 0
+HISTORIA_DNI = 30
+MAKS_NAZWA = 60
+MAKS_KLUCZ = 200
+
+# ── słowniki rozpoznawania ──────────────────────────────────────────────────
+
+# Agenci kodujący: nazwa procesu (comm) albo nazwa pliku w argv → nazwa ludzka.
+AGENCI = {
+    "claude": "Claude Code", "codex": "Codex", "gemini": "Gemini CLI",
+    "agy": "Antigravity", "copilot": "Copilot CLI", "opencode": "OpenCode",
+    "kiro-cli": "Kiro", "kiro": "Kiro", "vibe": "Mistral Vibe", "pi": "pi",
+    "omp": "omp", "grok": "Grok Build", "cursor-agent": "Cursor Agent",
+    "droid": "Factory Droid", "amp": "Amp", "cline": "Cline", "devin": "Devin",
+    "goose": "Goose", "aider": "Aider", "kimi": "Kimi Code", "kimi-code": "Kimi Code",
+    "kimi-cli": "Kimi Code", "qwen": "Qwen Code", "crush": "Crush", "muse": "Muse Code",
+    "hermes": "Hermes", "kimchi": "Kimchi", "dsh": "DeepSeek Harness",
+    "auggie": "Augment", "openhands": "OpenHands", "plandex": "Plandex",
+    "gptme": "gptme", "axel": "Axel", "agent-harness": "agent-harness",
+}
+# Agenci uruchamiani przez interpreter (node/bun/python) — rozpoznajemy po ścieżce.
+AGENCI_ARGV = [
+    (re.compile(r"node_modules/@anthropic-ai/claude-code/"), "Claude Code"),
+    # T3 Code, Conductor i inne aplikacje uruchamiają Claude przez Agent SDK
+    (re.compile(r"node_modules/@anthropic-ai/claude-agent-sdk/"), "Claude Code"),
+    (re.compile(r"node_modules/@google/gemini-cli/"), "Gemini CLI"),
+    (re.compile(r"node_modules/@openai/codex/"), "Codex"),
+    (re.compile(r"node_modules/opencode-ai/"), "OpenCode"),
+    (re.compile(r"node_modules/(?:@[\w.-]+/)?kimi-(?:code|cli)/"), "Kimi Code"),
+    (re.compile(r"node_modules/@github/copilot/"), "Copilot CLI"),
+    (re.compile(r"node_modules/@qwen-code/"), "Qwen Code"),
+    (re.compile(r"node_modules/@sourcegraph/amp/"), "Amp"),
+    (re.compile(r"node_modules/(?:@[\w.-]+/)?pi-coding-agent/"), "pi"),
+    (re.compile(r"node_modules/(?:@[\w.-]+/)?oh-my-pi/"), "omp"),
+]
+# Ślady sesji agenta w środowisku procesu (dziedziczone także po zerwaniu
+# łańcucha rodziców). Tylko nazwy zmiennych (wartości patrz srodowisko()).
+ZNACZNIKI_AGENTOW = {
+    "CLAUDECODE": "Claude Code", "CLAUDE_CODE_SESSION_ID": "Claude Code",
+    "CLAUDE_CODE_ENTRYPOINT": "Claude Code",
+    "KIMI_CODE_SESSION_ID": "Kimi Code", "KIMI_CODE_WORKSPACE_ID": "Kimi Code",
+    "GEMINI_CLI": "Gemini CLI",
+    "CODEX_THREAD_ID": "Codex", "CODEX_SANDBOX": "Codex",
+    "CODEX_SANDBOX_NETWORK_DISABLED": "Codex",
+    "OPENCODE": "OpenCode", "OPENCODE_SESSION_ID": "OpenCode",
+}
+# Konwencja nazw zmiennych, którą agenci znakują swoje procesy, także nieznani
+# z nazwy w ZNACZNIKI_AGENTOW: <AGENT>[_CODE]_SESSION_ID itp. — <AGENT> musi być
+# znanym agentem (AGENCI albo agenci.conf), żeby nie łapać przypadkowych zmiennych.
+ZNACZNIK_OGOLNY = re.compile(r"^([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*?)(?:_CODE|_CLI)?_(?:SESSION|THREAD|CONVERSATION|RUN|TASK)_ID$")
+# Ślady gospodarza (terminal / multiplekser / edytor) w środowisku.
+ZNACZNIKI_GOSPODARZA = [
+    ("TMUX", "tmux"), ("ZELLIJ", "Zellij"), ("STY", "screen"),
+    ("HERDR_PANE_ID", "herdr"), ("HERDR_SOCKET_PATH", "herdr"), ("HERDR_PLUGIN_ID", "herdr"),
+    ("WEZTERM_PANE", "WezTerm"), ("KITTY_WINDOW_ID", "kitty"),
+    ("ALACRITTY_WINDOW_ID", "Alacritty"), ("GHOSTTY_RESOURCES_DIR", "Ghostty"),
+    ("ZED_TERM", "Zed"), ("CURSOR_TRACE_ID", "Cursor"),
+    ("VSCODE_IPC_HOOK_CLI", "VS Code"), ("VSCODE_PID", "VS Code"),
+]
+# Ładne nazwy znanych gospodarzy; nieznany program pokazujemy pod jego nazwą.
+GOSPODARZE = {
+    "tmux": "tmux", "tmux: server": "tmux", "tmux: client": "tmux", "zellij": "Zellij",
+    "screen": "screen", "herdr": "herdr", "herdr-core": "herdr", "herdr-app": "herdr",
+    "rex": "Rex", "Rex": "Rex", "t3code": "T3 Code", "t3-code": "T3 Code", "t3": "T3 Code",
+    "T3 Code": "T3 Code",
+    "wezterm-gui": "WezTerm", "wezterm": "WezTerm", "wezterm-mux-ser": "WezTerm",
+    "kitty": "kitty", "alacritty": "Alacritty", "foot": "foot", "footclient": "foot",
+    "ghostty": "Ghostty", "konsole": "Konsole", "gnome-terminal-": "GNOME Terminal",
+    "ptyxis": "Ptyxis", "warp": "Warp", "code": "VS Code", "code-oss": "VS Code",
+    "cursor": "Cursor", "zed": "Zed", "zed-editor": "Zed", "windsurf": "Windsurf",
+    "conductor": "Conductor", "pane": "Pane", "sshd": "SSH", "sshd-session": "SSH",
+    "xdg-terminal-exec": "terminal", "supervisord": "supervisord", "pm2": "pm2",
+    "vscode": "VS Code", "iterm.app": "iTerm",
+}
+MENEDZERY_PROCESOW = {"pm2", "supervisord"}
+# Gospodarze interaktywni: terminale, multipleksery, edytory, menedżery agentów.
+# Jednostka systemd, której głównym procesem jest któryś z nich, to pojemnik.
+TERMINALE = set(GOSPODARZE.values()) - MENEDZERY_PROCESOW
+POWLOKI = {"bash", "sh", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
+           "xonsh", "elvish", "osh", "ysh", "oil"}
+# Programy-przekaźniki: uruchamiają coś dalej, ale same nie są gospodarzem.
+PRZEKAZNIKI = {
+    "node", "bun", "deno", "npm", "npx", "pnpm", "yarn", "corepack", "uv", "uvx",
+    "pip", "pipx", "poetry", "mise", "asdf", "env", "sudo", "doas", "timeout",
+    "nohup", "setsid", "script", "stdbuf", "unbuffer", "make", "just", "task",
+    "cargo", "go", "ruby", "bundle", "rails", "php", "java", "dotnet", "watchexec",
+    "nodemon", "concurrently", "turbo", "nx", "vite", "tsx", "ts-node", "entr",
+    "air", "reflex", "direnv", "nix", "devbox", "xargs", "flock", "nice", "ionice",
+    "systemd-run", "dbus-run-sessi", "MainThread", "node-MainThread",
+    "tini", "dumb-init", "catatonit",
+}
+# Na nich kończymy wędrówkę w górę — dalej jest już tylko sesja graficzna.
+GRANICE = {
+    "systemd", "init", "Hyprland", "start-hyprland", "uwsm", "sway", "niri", "river",
+    "gnome-shell", "kwin_wayland", "kwin_x11", "plasmashell", "labwc", "wayfire",
+    "login", "agetty", "sddm", "gdm", "greetd", "lightdm", "Xorg", "Xwayland",
+    "containerd-shim", "containerd-shim-runc-v2", "dockerd", "conmon",
+}
+SESJE = GRANICE - {"systemd", "init", "containerd-shim", "containerd-shim-runc-v2", "dockerd", "conmon"}
+STALE_STANY_JEDNOSTEK = {"enabled", "enabled-runtime", "static", "indirect", "generated",
+                         "alias", "linked", "linked-runtime"}
+WORKTREE_SCIEZKA = re.compile(r"(?:^|/)(?:[^/]+-wt|\.?worktrees?)(?:/|$)")
+# Katalog z losową końcówką (mktemp -d, fs.mkdtemp, tempfile): nazwa zmienia się
+# przy każdym uruchomieniu/aktualizacji, więc nie nadaje się na etykietę ani klucz.
+LOSOWA_NAZWA = re.compile(r"(?:[-_.](?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])[A-Za-z0-9]{6,8}|^tmp[a-z0-9_]{6,10})$")
+LOSOWY_HASH = re.compile(r"^[0-9a-f]{12,}$")
+# <repo>/[.ukryty/]worktrees/<nazwa>[/<dalej>] — worktree Claude Code, Codex itp.
+WT_W_SCIEZCE = re.compile(r"^(?P<baza>.*?)/(?:\.[\w.-]+/)?\.?worktrees?/(?P<wt>[^/]+)(?:/(?P<dalej>[^/]+))?")
+USUNIETY = " (deleted)"
 
 
 def uruchom(argv, timeout=15):
@@ -38,12 +202,40 @@ def uruchom(argv, timeout=15):
         return ""
 
 
+def czytaj_json(sciezka, domyslnie):
+    try:
+        with open(sciezka, encoding="utf-8") as f:
+            dane = json.load(f)
+        return dane if isinstance(dane, type(domyslnie)) else domyslnie
+    except (OSError, ValueError):
+        return domyslnie
+
+
+def zapisz_json(sciezka, dane, tryb=0o644, wciecie=1):
+    """Zapis atomowy: plik tymczasowy w tym samym katalogu + rename."""
+    katalog = os.path.dirname(sciezka)
+    os.makedirs(katalog, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=katalog, prefix="." + os.path.basename(sciezka) + ".")
+    try:
+        os.fchmod(fd, tryb)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(dane, f, ensure_ascii=False, indent=wciecie)
+            f.write("\n")
+        os.replace(tmp, sciezka)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def przyjazne_nazwy():
     """port → [nazwa, jednostka?]; '!' ukrywa port. Plik ~/.config/local-www.map
     (stara nazwa uslugi-www.map działa dalej). Format: `port nazwa [unit]`."""
     nazwy = {p: [n] for p, n in DOMYSLNE_NAZWY.items()}
-    for plik in (os.path.expanduser("~/.config/local-www.map"),
-                 os.path.expanduser("~/.config/uslugi-www.map")):
+    for plik in (os.path.join(HOME, ".config", "local-www.map"),
+                 os.path.join(HOME, ".config", "uslugi-www.map")):
         try:
             with open(plik, encoding="utf-8") as f:
                 for linia in f:
@@ -55,6 +247,23 @@ def przyjazne_nazwy():
     return nazwy
 
 
+def agenci_uzytkownika():
+    """Dodatkowi agenci z ~/.config/uslugi-www/agenci.conf: `proces Nazwa`."""
+    wynik = {}
+    try:
+        with open(AGENCI_PLIK, encoding="utf-8") as f:
+            for linia in f:
+                linia = linia.split("#", 1)[0].strip()
+                if not linia:
+                    continue
+                proces, _, nazwa = linia.partition(" ")
+                if proces:
+                    wynik[proces] = czysc_nazwe(nazwa) or proces
+    except OSError:
+        pass
+    return wynik
+
+
 def host_url(adres):
     a = adres.strip("[]")
     if a in ("0.0.0.0", "::", "*", "", "::1"):
@@ -62,20 +271,89 @@ def host_url(adres):
     return a
 
 
+def cmdline_lista(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            surowe = f.read()
+    except OSError:
+        return []
+    return [c.decode("utf-8", "replace") for c in surowe.split(b"\0") if c]
+
+
 def cmdline_tekst(pid):
     """Cmdline jako tekst. Programy typu setproctitle (chromium) przepisują
     argv w jeden string ze spacjami."""
+    return " ".join(cmdline_lista(pid))
+
+
+def comm(pid):
     try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().decode("utf-8", "replace").replace("\0", " ")
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+            return f.read().strip()
     except OSError:
         return ""
+
+
+def rodzic(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return int(f.read().rsplit(") ", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
 
 
 def cgroup_tekst(pid):
     try:
         with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
             return f.read()
+    except OSError:
+        return ""
+
+
+def srodowisko(pid):
+    """Ślady w środowisku procesu. Zwraca tylko: NAZWY zmiennych, nazwę terminala
+    (TERM_PROGRAM), nazwę agenta (AI_AGENT) — obie skrócone — i czy któraś
+    wartość zawiera ścieżkę deploy/docker. Inne wartości nie wychodzą poza funkcję."""
+    wynik = {"nazwy": set(), "term_program": "", "ai_agent": "", "deploy_docker": False}
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            surowe = f.read()
+    except OSError:
+        return wynik
+    for wpis in surowe.split(b"\0"):
+        nazwa, _, wartosc = wpis.partition(b"=")
+        if not nazwa:
+            continue
+        n = nazwa.decode("utf-8", "replace")
+        wynik["nazwy"].add(n)
+        if n == "TERM_PROGRAM":
+            wynik["term_program"] = czysc_nazwe(wartosc.decode("utf-8", "replace"))[:40]
+        elif n == "AI_AGENT":
+            wynik["ai_agent"] = czysc_nazwe(wartosc.decode("utf-8", "replace"))[:40]
+        if b"deploy/docker" in wartosc:
+            wynik["deploy_docker"] = True
+    return wynik
+
+
+def ma_terminal(pid):
+    """Czy proces ma terminal sterujący (tty_nr ≠ 0) — usługi systemd go nie mają."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return int(f.read().rsplit(") ", 1)[1].split()[4]) != 0
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def wlasciciel(pid):
+    try:
+        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+    except (OSError, KeyError):
+        return ""
+
+
+def katalog_roboczy(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
     except OSError:
         return ""
 
@@ -91,27 +369,55 @@ def btime():
     return 0
 
 
-# ── metryki ─────────────────────────────────────────────────────────────────
-
-def stan_cache():
+def czas_docker(tekst):
+    """'2026-10-15T05:23:21.95Z' (UTC) → epoch; None gdy pusto/zero."""
     try:
-        with open(CACHE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+        t = calendar.timegm(time.strptime(tekst[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+    return t if t > 0 else None
 
 
-def zapisz_cache(stan):
+def czas_narodzin(sciezka):
+    """Czas utworzenia pliku (statx birth) — od kiedy istnieje jednostka."""
+    out = uruchom(["stat", "-c", "%W", sciezka], timeout=5).strip()
+    return int(out) if out.isdigit() and int(out) > 0 else None
+
+
+def pierwsza_instalacja_pakietu(sciezka):
+    """Plik z pakietu: data PIERWSZEJ instalacji pakietu z pacman.log.
+    (Czas narodzin pliku zmienia się przy każdej aktualizacji pakietu.)"""
+    pakiet = uruchom(["pacman", "-Qqo", sciezka], timeout=10).strip().splitlines()
+    if not pakiet:
+        return None
+    wzor = f"[ALPM] installed {pakiet[0]} ("
     try:
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump(stan, f)
+        with open("/var/log/pacman.log", encoding="utf-8", errors="replace") as f:
+            for linia in f:
+                if wzor in linia:
+                    m = re.match(r"\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4})\]", linia)
+                    if m:
+                        return int(datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S%z").timestamp())
+                    return None
     except OSError:
         pass
+    return None
 
+
+def od_jednostki(sciezka):
+    """Od kiedy istnieje jednostka systemd: pakiet → pierwsza instalacja,
+    plik użytkownika/admina → czas utworzenia pliku."""
+    if not sciezka:
+        return None
+    if sciezka.startswith("/usr/"):
+        return pierwsza_instalacja_pakietu(sciezka)
+    return czas_narodzin(sciezka)
+
+
+# ── metryki ─────────────────────────────────────────────────────────────────
 
 def metryki(pid, stan, teraz):
-    """(cpu %|None, mem_mb|None, uptime_s|None) z /proc/PID/stat."""
+    """(cpu %|None, mem_mb|None, uptime_s|None, start_epoch|None) z /proc/PID/stat."""
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
             pola = f.read().rsplit(") ", 1)[1].split()
@@ -119,7 +425,7 @@ def metryki(pid, stan, teraz):
         startticks = int(pola[19])
         rss = int(pola[21])
     except (OSError, IndexError, ValueError):
-        return None, None, None
+        return None, None, None, None
     ticks = utime + stime
     klucz = str(pid)
     poprzednie = stan.get(klucz)
@@ -129,20 +435,9 @@ def metryki(pid, stan, teraz):
         cpu = max(0.0, (ticks - poprzednie[0]) / HZ / dt * 100.0)
     stan[klucz] = [ticks, teraz]
     mem_mb = rss * STRONA / 1024 / 1024
-    uptime = max(0, int(teraz - (BTIME + startticks / HZ)))
-    return round(cpu, 1) if cpu is not None else None, round(mem_mb, 1), uptime
-
-
-def format_uptime(s):
-    if s is None:
-        return ""
-    if s < 60:
-        return f"{s} s"
-    if s < 3600:
-        return f"{s // 60} min"
-    if s < 86400:
-        return f"{s // 3600} h {s % 3600 // 60:02d} min"
-    return f"{s // 86400} d {s % 86400 // 3600} h"
+    start = BTIME + startticks / HZ
+    uptime = max(0, int(teraz - start))
+    return (round(cpu, 1) if cpu is not None else None, round(mem_mb, 1), uptime, int(start))
 
 
 # ── środowisko ──────────────────────────────────────────────────────────────
@@ -161,7 +456,7 @@ def srodowisko_procesu(pid):
     if "lxc.payload" in cg:
         return "lxc"
     m = re.search(r"(?:app|system)\.slice/([\w@.-]+\.service)", cg)
-    if m:
+    if m and not m.group(1).startswith(("run-", "hc-hold-")):
         return "service"
     if os.path.exists(f"/proc/{pid}/root/.flatpak-info"):
         return "flatpak"
@@ -176,12 +471,7 @@ def srodowisko_procesu(pid):
         return "venv"
     if "--remote-debugging-port" in cmd:
         return "devtools"
-    exe = ""
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
-            exe = f.read().split("(",  1)[1].split(")")[0]
-    except (OSError, IndexError):
-        pass
+    exe = comm(pid)
     if exe == "java":
         return "java"
     if exe == "node" or re.search(r"\b(npm|vite|next|npx) ", cmd):
@@ -189,14 +479,6 @@ def srodowisko_procesu(pid):
     if exe.startswith("python") or re.search(r"\b(uvicorn|gunicorn|flask) ", cmd):
         return "python"
     return "process"
-
-
-def environ_tekst(pid):
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as f:
-            return f.read().decode("utf-8", "replace").replace("\0", " ")
-    except OSError:
-        return ""
 
 
 def pid_po_jednostce(jednostka):
@@ -211,10 +493,338 @@ def pid_po_jednostce(jednostka):
     return None
 
 
+# ── kto: agent, gospodarz, jednostka, projekt ───────────────────────────────
+
+def nazwa_pliku(arg):
+    base = os.path.basename(arg)
+    for ext in (".js", ".mjs", ".cjs", ".ts", ".py", ".exe", ".AppImage"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    return base
+
+
+def agent_procesu(pid, agenci):
+    """Nazwa agenta, jeśli TEN proces jest agentem kodującym, inaczej ''."""
+    c = comm(pid)
+    if c in agenci:
+        return agenci[c]
+    argv = cmdline_lista(pid)
+    for arg in argv[:2]:
+        n = nazwa_pliku(arg)
+        if n in agenci:
+            return agenci[n]
+    glowa = " ".join(argv[:3])
+    for wzor, nazwa in AGENCI_ARGV:
+        if wzor.search(glowa):
+            return nazwa
+    return ""
+
+
+def ladna_nazwa_gospodarza(pid):
+    c = comm(pid)
+    if c in GOSPODARZE:
+        return GOSPODARZE[c]
+    if c.startswith("PM2"):
+        return "pm2"
+    argv = cmdline_lista(pid)
+    if argv:
+        n = nazwa_pliku(argv[0])
+        if n in GOSPODARZE:
+            return GOSPODARZE[n]
+        if c in ("electron", "MainThread", "") and n:
+            return n
+    return c
+
+
+def czy_przekaznik(nazwa):
+    return (nazwa in PRZEKAZNIKI or nazwa.startswith(("python", "node", "ruby", "perl", "php"))
+            or nazwa in POWLOKI)
+
+
+def lancuch(pid, agenci):
+    """Idzie w górę po rodzicach aż do granicy sesji (systemd, Hyprland…) — cały
+    łańcuch, bo agent może stać nad nieznanym programem pośrednim. Zwraca dict:
+    agent       najbliższy agent-przodek ('' gdy brak),
+    gospodarz   pierwszy prawdziwy program nad agentem; bez agenta — nad
+                najbliższą powłoką; bez obu — najbliższy prawdziwy program,
+    powloka     czy pod gospodarzem była powłoka (ktoś wpisał/wywołał komendę),
+    menedzer    pm2/supervisord, gdy pilnuje procesu,
+    terminal    czy proces albo któryś przodek ma terminal sterujący,
+    pidy        pidy przodków (do sprawdzenia głównego procesu jednostki)."""
+    ogniwa = []   # (rodzaj, nazwa): agent | powloka | przekaznik | program
+    pidy = []
+    terminal = ma_terminal(pid)
+    p = rodzic(pid)
+    for _ in range(40):
+        if p <= 1:
+            break
+        c = comm(p)
+        if not c or c in GRANICE:
+            break
+        pidy.append(p)
+        terminal = terminal or ma_terminal(p)
+        a = agent_procesu(p, agenci)
+        if a:
+            ogniwa.append(("agent", a))
+        elif c in POWLOKI:
+            ogniwa.append(("powloka", c))
+        elif czy_przekaznik(c):
+            ogniwa.append(("przekaznik", c))
+        else:
+            ogniwa.append(("program", ladna_nazwa_gospodarza(p)))
+        p = rodzic(p)
+
+    def pierwszy(rodzaj, od=0):
+        return next((i for i in range(od, len(ogniwa)) if ogniwa[i][0] == rodzaj), None)
+
+    i_agent = pierwszy("agent")
+    i_powloka = pierwszy("powloka")
+    kotwica = i_agent if i_agent is not None else i_powloka
+    i_gosp = pierwszy("program", kotwica + 1 if kotwica is not None else 0)
+    gospodarz = ogniwa[i_gosp][1] if i_gosp is not None else ""
+    gorna = i_gosp if i_gosp is not None else len(ogniwa)
+    menedzer = next((n for r, n in ogniwa if r == "program" and n in MENEDZERY_PROCESOW), "")
+    return {
+        "agent": ogniwa[i_agent][1] if i_agent is not None else "",
+        "gospodarz": gospodarz,
+        "powloka": any(r == "powloka" for r, _ in ogniwa[:gorna]),
+        "menedzer": menedzer,
+        "terminal": terminal,
+        "pidy": pidy,
+    }
+
+
+def start_ticks(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return int(f.read().rsplit(") ", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return 1 << 62
+
+
+def gospodarz_z_cgroup(pid, agenci):
+    """Najstarszy „prawdziwy” proces w tej samej grupie systemd. Procesu nie da
+    się z niej wypiąć (setsid/nohup/demon), więc to najpewniejszy ślad terminala
+    czy menedżera sesji, gdy łańcuch rodziców jest zerwany."""
+    linie = cgroup_tekst(pid).strip().splitlines()
+    sciezka = linie[-1].split("::", 1)[-1] if linie else ""
+    if not sciezka or ".." in sciezka:
+        return ""
+    try:
+        with open(f"/sys/fs/cgroup{sciezka}/cgroup.procs", encoding="utf-8") as f:
+            pidy = [int(x) for x in f.read().split()[:400]]
+    except (OSError, ValueError):
+        return ""
+    for p in sorted(pidy, key=start_ticks):
+        if p == pid:
+            continue
+        c = comm(p)
+        if not c or c in POWLOKI or c in GRANICE or czy_przekaznik(c) or agent_procesu(p, agenci):
+            continue
+        return ladna_nazwa_gospodarza(p)
+    return ""
+
+
+_BAZA_SRODOWISKA = None
+
+
+def baza_srodowiska():
+    """Zmienne ustawione dla całej sesji — nie są śladem konkretnego terminala."""
+    global _BAZA_SRODOWISKA
+    if _BAZA_SRODOWISKA is None:
+        _BAZA_SRODOWISKA = {l.split("=", 1)[0] for l in
+                            uruchom(["systemctl", "--user", "show-environment"], timeout=5).splitlines()}
+    return _BAZA_SRODOWISKA
+
+
+def ladna_nazwa_aplikacji(app_id):
+    """'org.wezfurlong.wezterm' → 'WezTerm', 'xdg-terminal-exec' → 'terminal'."""
+    n = app_id.replace("\\x2d", "-")
+    if "." in n:
+        n = n.rsplit(".", 1)[1]
+    return GOSPODARZE.get(n, GOSPODARZE.get(n.lower(), n))
+
+
+def jednostka_z_cgroup(cg):
+    """(menedżer 'user'|'system', jednostka) — ostatni element ścieżki cgroup."""
+    sciezka = cg.strip().splitlines()[-1].split("::", 1)[-1] if cg.strip() else ""
+    for czesc in reversed(sciezka.split("/")):
+        if czesc.endswith((".service", ".scope")):
+            return ("user" if "/user@" in sciezka else "system"), czesc
+    return "", ""
+
+
+def aplikacja_z_jednostki(jednostka):
+    """app-Hyprland-herdr-a57d1bfb.scope / app-Hyprland-org.x.y@abc.service → nazwa."""
+    m = re.match(r"app-(?:[A-Za-z]+-)?(.+?)(?:-[0-9a-f]{6,}\.scope|@[0-9a-f]*\.service|\.scope|\.service)$",
+                 jednostka)
+    return ladna_nazwa_aplikacji(m.group(1)) if m else ""
+
+
+def info_jednostek(jednostki):
+    """{(menedżer, jednostka): {UnitFileState, FragmentPath, ActiveEnterTimestamp,
+    NRestarts, Transient, Description}} — jedno wywołanie systemctl na menedżer."""
+    wynik = {}
+    for menedzer in ("user", "system"):
+        lista = sorted({j for m, j in jednostki if m == menedzer})
+        if not lista:
+            continue
+        argv = ["systemctl"] + (["--user"] if menedzer == "user" else []) + [
+            "show", "--timestamp=unix",
+            "-p", "Id,UnitFileState,FragmentPath,ActiveEnterTimestamp,NRestarts,Transient,MainPID"] + lista
+        blok = {}
+        for linia in uruchom(argv).splitlines() + [""]:
+            if not linia.strip():
+                if blok.get("Id"):
+                    wynik[(menedzer, blok["Id"])] = blok
+                blok = {}
+                continue
+            k, _, v = linia.partition("=")
+            blok[k] = v
+    return wynik
+
+
+def jednostka_pojemnik(jednostka, info):
+    """Jednostka, która tylko „trzyma” cudze procesy: sesja Hyprland
+    (wayland-wm@…), serwer tmux/foot, aplikacja pulpitu — jej główny proces
+    to granica sesji albo terminal/edytor/menedżer agentów."""
+    mp = info.get("MainPID", "")
+    if mp.isdigit() and int(mp) > 1:
+        # tylko granice SESJI — conmon/containerd-shim to główne procesy
+        # prawdziwych usług-kontenerów (np. Podman Quadlet), nie pojemniki
+        if comm(int(mp)) in SESJE or ladna_nazwa_gospodarza(int(mp)) in TERMINALE:
+            return True
+    return jednostka.startswith(("wayland-wm", "graphical-session"))
+
+
+def tylda(sciezka):
+    return "~" + sciezka[len(HOME):] if sciezka == HOME or sciezka.startswith(HOME + "/") else sciezka
+
+
+def etykieta_sciezki(sciezka):
+    """(etykieta, korzeń) z samej ścieżki — działa też dla usuniętych folderów,
+    więc przed i po usunięciu worktree daje to samo."""
+    m = WT_W_SCIEZCE.match(sciezka)
+    if m:
+        baza, wt, dalej = m.group("baza"), m.group("wt"), m.group("dalej")
+        koniec = sciezka[:m.end("wt")]
+        if baza == HOME and dalej:
+            if re.fullmatch(r"[0-9a-f]{4,}|[0-9]+", wt):   # ~/.codex/worktrees/<id>/<repo>
+                return f"{dalej} / {wt}", koniec + "/" + dalej
+            return f"{wt} / {dalej}", koniec + "/" + dalej  # ~/.t3/worktrees/<repo>/<gałąź>
+        return f"{os.path.basename(baza)} / {wt}", koniec
+    projekty = os.path.join(HOME, "Projects") + "/"
+    if sciezka.startswith(projekty):
+        czesci = sciezka[len(projekty):].split("/")
+        if len(czesci) >= 2 and czesci[0].endswith("-wt"):
+            return f"{czesci[0][:-3]} / {czesci[1]}", projekty + "/".join(czesci[:2])
+        return czesci[0], projekty + czesci[0]
+    if sciezka.startswith(HOME + "/"):
+        czesci = sciezka[len(HOME) + 1:].split("/")[:2]
+        return "~/" + "/".join(czesci), os.path.join(HOME, *czesci)
+    return sciezka, sciezka
+
+
+def repo_od(sciezka):
+    """Repozytorium / worktree git, w którym leży ISTNIEJĄCY folder — dict albo None."""
+    projekty = os.path.join(HOME, "Projects") + "/"
+    cur = sciezka
+    for _ in range(25):
+        if cur in (HOME, "/", ""):
+            return None   # repozytorium dotfiles w $HOME nie jest „projektem” usługi
+        git = os.path.join(cur, ".git")
+        if os.path.isdir(git):
+            if LOSOWA_NAZWA.search(os.path.basename(cur)) and not cur.startswith(projekty):
+                return None   # checkout narzędzia w katalogu tymczasowym — etykieta z folderu nad nim
+            return {"projekt": os.path.basename(cur), "worktree": False, "korzen": tylda(cur)}
+        if os.path.isfile(git):
+            glowne = ""
+            try:
+                with open(git, encoding="utf-8") as f:
+                    m = re.match(r"gitdir:\s*(.+?)/\.git/worktrees/", f.read())
+                glowne = os.path.basename(m.group(1)) if m else ""
+            except OSError:
+                pass
+            nazwa = os.path.basename(cur)
+            if nazwa == glowne:   # ~/.codex/worktrees/<id>/<repo> — rozróżnia je <id>
+                nazwa = os.path.basename(os.path.dirname(cur))
+            return {"projekt": f"{glowne} / {nazwa}" if glowne else nazwa,
+                    "worktree": True, "korzen": tylda(cur)}
+        wyzej = os.path.dirname(cur)
+        if wyzej == cur:
+            return None
+        cur = wyzej
+    return None
+
+
+def projekt_info(sciezka):
+    """Repozytorium / worktree / folder, z którego działa usługa.
+    korzen — stały folder usługi (do klucza): korzeń repozytorium albo folderu.
+    Folder usunięty (jądro dopisuje „ (deleted)”): skaner pamięta korzeń
+    działającego procesu (pamiec_projektu); ta funkcja to zapas, gdy proces
+    pierwszy raz widać już po usunięciu."""
+    usuniety = bool(sciezka) and sciezka.endswith(USUNIETY)
+    if usuniety:
+        sciezka = sciezka[: -len(USUNIETY)]
+    if not sciezka or sciezka in ("/", HOME):
+        return {"projekt": "", "worktree": False, "istnieje": True, "korzen": ""}
+    istnieje = not usuniety and os.path.isdir(sciezka)
+    worktree = bool(WORKTREE_SCIEZKA.search(sciezka))
+    if istnieje:
+        repo = repo_od(sciezka)
+        if repo:
+            return dict(repo, istnieje=True)
+    etykieta, korzen = etykieta_sciezki(sciezka)
+    wynik = {"projekt": etykieta, "worktree": worktree, "istnieje": istnieje, "korzen": tylda(korzen)}
+    if istnieje or worktree:
+        return wynik   # korzeń worktree wynika z samej ścieżki — przed i po usunięciu ten sam
+    # Najgłębszy folder, który jeszcze stoi.
+    stoi = os.path.dirname(sciezka)
+    while stoi not in ("/", "") and not os.path.isdir(stoi):
+        stoi = os.path.dirname(stoi)
+    repo = repo_od(stoi) if stoi not in ("/", "") else None
+    if repo:
+        return dict(repo, istnieje=False)   # zniknął podfolder w żywym repo (np. dist/ po przebudowie)
+    if os.path.isdir(korzen):
+        return wynik   # folder projektu stoi, zniknął tylko podfolder
+    # Zniknął cały projekt: korzeniem jest najwyższy usunięty folder
+    # (chyba że to losowy katalog tymczasowy — wtedy stały folder nad nim).
+    brak = sciezka
+    while os.path.dirname(brak) != stoi and os.path.dirname(brak) != brak:
+        brak = os.path.dirname(brak)
+    ponizej = sciezka[len(korzen):].split("/") if sciezka.startswith(korzen) else []
+    losowe = any(LOSOWA_NAZWA.search(c) or LOSOWY_HASH.match(c) for c in ponizej if c)
+    if not losowe and len(brak) > len(korzen) and brak.startswith(korzen):
+        wynik["korzen"] = tylda(brak)
+    return wynik
+
+
+# Pamięć „pid:start → projekt” działających procesów: korzeń zapamiętany, póki
+# folder istniał, zostaje po jego usunięciu (nazwa i kolor nie przepadają).
+_PAMIEC_PROJEKTOW = {}
+_NOWA_PAMIEC = {}
+
+
+def pamiec_projektu(pid, proj):
+    ident = f"{pid}:{start_ticks(pid)}"
+    if not proj["istnieje"]:
+        stare = _PAMIEC_PROJEKTOW.get(ident)
+        if stare:
+            proj = dict(stare, istnieje=False)
+    _NOWA_PAMIEC[ident] = {"projekt": proj["projekt"], "worktree": proj["worktree"], "korzen": proj["korzen"]}
+    return proj
+
+
+def czysc_pamiec(pamiec):
+    return {str(k): v for k, v in pamiec.items()
+            if isinstance(v, dict) and isinstance(v.get("projekt"), str)
+            and isinstance(v.get("korzen"), str) and isinstance(v.get("worktree"), bool)}
+
+
 # ── źródła usług ────────────────────────────────────────────────────────────
 
 def kontenery():
-    """docker ps + inspect → [(nazwa, adres, port, srodowisko, tech, pid, start_s)]."""
+    """docker ps + inspect → lista słowników (jeden na opublikowany port)."""
     wynik = []
     out = uruchom(["docker", "ps", "--format",
                    "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Ports}}\t{{.ID}}"])
@@ -224,27 +834,31 @@ def kontenery():
             continue
         nazwa, compose, porty, cid = czesci
         insp = uruchom(["docker", "inspect", "--format",
-                        "{{.State.StartedAt}}\t{{.State.Pid}}", cid])
-        start_s, pid = None, None
+                        "{{.State.StartedAt}}\t{{.State.Pid}}\t{{.Created}}\t{{.RestartCount}}\t"
+                        "{{.HostConfig.RestartPolicy.Name}}\t"
+                        "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}", cid])
         cz = insp.strip().split("\t")
-        if len(cz) == 2:
-            try:
-                t = time.strptime(cz[0][:19], "%Y-%m-%dT%H:%M:%S")
-                start_s = max(0, int(time.time() - time.mktime(t)))
-            except ValueError:
-                pass
-            pid = int(cz[1]) if cz[1].isdigit() else None
+        cz += [""] * (6 - len(cz))
+        info = {
+            "start": czas_docker(cz[0]), "pid": int(cz[1]) if cz[1].isdigit() and cz[1] != "0" else None,
+            "utworzony": czas_docker(cz[2]), "restarty": int(cz[3]) if cz[3].isdigit() else 0,
+            "polityka": cz[4] or "no", "katalog": cz[5], "compose": compose,
+        }
         tech = ("compose", compose) if compose else ("docker", "")
         for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
-            wynik.append((nazwa, m.group(1), int(m.group(2)), "Docker", tech, pid, start_s))
+            wynik.append(dict(info, nazwa=nazwa, adres=m.group(1), port=int(m.group(2)), tech=tech))
     return wynik
 
 
-def gniazda():
-    """ss -tlnp → [(adres, port, proces|None, pid|None)] — także gniazda
-    usług roota (bez nazwy procesu); te rozstrzyga mapa portów."""
+def parsuj_ss(tekst, wiek=None):
+    """Wyjście `ss -tlnp` → [(adres, port, proces|None, pid|None, wszystkie pidy)] — także gniazda
+    usług roota (bez nazwy procesu); te rozstrzyga mapa portów. Gdy gniazdo
+    dzieli kilka procesów (serwer pre-fork: master + workery, --reload:
+    nadzorca + aplikacja), tożsamość i start bierzemy z najstarszego — workery
+    wymieniane w locie to nie restart usługi; CPU i RAM sumujemy po wszystkich."""
+    wiek = wiek or start_ticks
     wynik = []
-    for linia in uruchom(["ss", "-tlnp"]).splitlines():
+    for linia in tekst.splitlines():
         if not linia.startswith("LISTEN"):
             continue
         czesci = linia.split()
@@ -253,10 +867,17 @@ def gniazda():
         adres, _, port = czesci[3].rpartition(":")
         if not port.isdigit():
             continue
-        m = re.search(r'\("([^"]+)",pid=(\d+)', linia)
-        wynik.append((adres, int(port), m.group(1) if m else None,
-                      int(m.group(2)) if m else None))
+        procesy = [(n, int(p)) for n, p in re.findall(r'\("([^"]+)",pid=(\d+)', linia)]
+        if procesy:
+            nazwa, pid = min(procesy, key=lambda np: (wiek(np[1]), np[1]))
+        else:
+            nazwa, pid = None, None
+        wynik.append((adres, int(port), nazwa, pid, sorted(p for _, p in procesy)))
     return wynik
+
+
+def gniazda():
+    return parsuj_ss(uruchom(["ss", "-tlnp"]))
 
 
 def nazwa_z_profilu(pid, proces):
@@ -272,29 +893,328 @@ def nazwa_z_profilu(pid, proces):
     return (profil or proces + "-devtools"), ("devtools-browser", "")
 
 
+def zrodlo_procesu(pid):
+    if "venv" in cmdline_tekst(pid):
+        return "venv"
+    return "proces"
+
+
+# ── klasyfikacja ────────────────────────────────────────────────────────────
+
+def agent_ze_srodowiska(env, agenci, baza):
+    """(nazwa agenta, zmienna) ze śladów sesji agenta w środowisku procesu.
+    Zmienne ustawione dla całej sesji (baza) nie są śladem."""
+    nazwy = env["nazwy"] - baza
+    for z, nazwa in ZNACZNIKI_AGENTOW.items():
+        if z in nazwy:
+            return nazwa, z
+    for z in sorted(nazwy):
+        m = ZNACZNIK_OGOLNY.match(z)
+        klucz = (m.group(1) if m else (z if len(z) >= 5 else "")).lower().replace("_", "-")
+        if klucz in agenci:
+            return agenci[klucz], z
+    if env["ai_agent"] and "AI_AGENT" in nazwy:
+        return agent_z_nazwy(env["ai_agent"], agenci), "AI_AGENT"
+    return "", ""
+
+
+def agent_z_nazwy(tekst, agenci):
+    """Wartość AI_AGENT → nazwa ludzka: 'claude-code_2-1-331_agent' → 'Claude Code',
+    'opencode' → 'OpenCode'; nieznany agent zostaje pod własną nazwą (bez wersji)."""
+    tokeny = [t for t in re.split(r"[_\s/@:]+", tekst.lower()) if t and not t[0].isdigit()
+              and t not in ("agent", "cli", "v")]
+    for t in tokeny:
+        if t in agenci:
+            return agenci[t]
+        if t.split("-")[0] in agenci:
+            return agenci[t.split("-")[0]]
+    return czysc_nazwe(tokeny[0] if tokeny else tekst)[:30]
+
+
+def rozstrzygnij(f):
+    """Rodzaj usługi z zebranych faktów — czysta funkcja (testowalna).
+    f: sam, agent_lancuch, agent_env, powloka, gospodarz, gospodarz_z_lancucha,
+       terminal_env, jednostka, jednostka_wlasna, jednostka_stala, jednostka_run,
+       menedzer, worktree, projekt, istnieje.
+    Zwraca (rodzaj, powody, agent, sam_wstaje)."""
+    powody, rodzaj, agent, sam_wstaje = [], "", "", False
+    if f["sam"]:
+        agent, rodzaj = f["sam"], "narzedzie"
+        powody.append(["agent-sam", agent])
+    elif f["agent_lancuch"]:
+        agent, rodzaj = f["agent_lancuch"], "test"
+        powody.append(["agent-przodek", agent])
+    elif f["agent_env"]:
+        agent, rodzaj = f["agent_env"], "test"
+        powody.append(["agent-znacznik", agent])
+    if f["worktree"]:
+        powody.append(["worktree", f["projekt"]])
+        rodzaj = rodzaj or "test"
+    if not f["istnieje"]:
+        powody.append(["osierocona", ""])
+    if f["jednostka_wlasna"]:
+        if f["jednostka_stala"]:
+            sam_wstaje = True
+            powody.append(["unit-stala", f["jednostka"]])
+            rodzaj = rodzaj or "stala"
+        else:
+            powody.append(["unit-reczna", f["jednostka"]])
+            rodzaj = rodzaj or "reczna"
+    elif f["jednostka_run"]:
+        powody.append(["unit-tymczasowa", f["jednostka"]])
+    if f["menedzer"] and not agent:
+        sam_wstaje = True
+        powody.append(["menedzer", f["menedzer"]])
+        rodzaj = rodzaj or "stala"
+    if not rodzaj:
+        if f["powloka"]:
+            rodzaj = "reczna"
+            powody.append(["terminal", f["gospodarz"]])
+        elif f["gospodarz"] and not f["gospodarz_z_lancucha"] and f["terminal_env"]:
+            # łańcuch zerwany (nohup/setsid), a proces ma środowisko terminala
+            rodzaj = "reczna"
+            powody.append(["odlaczona", f["gospodarz"]])
+        elif f["gospodarz"]:
+            rodzaj = "narzedzie"
+            powody.append(["narzedzie", f["gospodarz"]])
+        else:
+            rodzaj = "nieznana"
+    return rodzaj, powody, agent, sam_wstaje
+
+
+def klasyfikuj_proces(pid, agenci, jednostki_info, env):
+    """Zbiera fakty o procesie i rozstrzyga rodzaj.
+    Zwraca (rodzaj, powody, kto, sam_wstaje, osierocona, od_hint, start_hint, korzen)."""
+    kto = {"agent": "", "gospodarz": "", "jednostka": "", "menedzer": "", "compose": "",
+           "projekt": "", "uzytkownik": wlasciciel(pid)}
+    baza = baza_srodowiska()
+    sam = agent_procesu(pid, agenci)
+    lan = lancuch(pid, agenci)
+    agent_env, _ = agent_ze_srodowiska(env, agenci, baza)
+    menedzer, jednostka = jednostka_z_cgroup(cgroup_tekst(pid))
+    info = jednostki_info.get((menedzer, jednostka), {})
+    tymczasowa = info.get("Transient") == "yes" or jednostka.endswith(".scope")
+    pojemnik = tymczasowa or (bool(info) and jednostka_pojemnik(jednostka, info))
+    terminal_env = "TERM" in env["nazwy"] and "TERM" not in baza
+    # Usługa należy do jednostki, gdy to jej główny proces albo jego dziecko
+    # (przez przekaźniki/`sh -c`) — bez agenta i bez terminala po drodze.
+    mp = info.get("MainPID", "")
+    glowny = int(mp) if mp.isdigit() else 0
+    wlasna = (bool(jednostka) and bool(info) and not pojemnik and not sam and not lan["agent"]
+              and not agent_env and not lan["terminal"] and not terminal_env
+              and (glowny <= 1 or glowny == pid or glowny in lan["pidy"]))
+
+    # Gospodarz, gdy łańcuch rodziców nic nie dał — od najpewniejszego śladu:
+    # grupa systemd → nazwa aplikacji w jednostce → zmienne terminala
+    # (bez tych ustawionych globalnie dla sesji) → TERM_PROGRAM.
+    gospodarz = lan["gospodarz"]
+    z_lancucha = bool(gospodarz)
+    if not gospodarz and jednostka and pojemnik:
+        gospodarz = gospodarz_z_cgroup(pid, agenci) or aplikacja_z_jednostki(jednostka)
+    if not gospodarz:
+        for zmienna, nazwa in ZNACZNIKI_GOSPODARZA:
+            if zmienna in env["nazwy"] and zmienna not in baza:
+                gospodarz = nazwa
+                break
+        else:
+            term = env["term_program"]
+            if term and "TERM_PROGRAM" not in baza:
+                gospodarz = GOSPODARZE.get(term.lower(), term)
+    kto["gospodarz"] = gospodarz
+    proj = pamiec_projektu(pid, projekt_info(katalog_roboczy(pid)))
+    kto["projekt"] = proj["projekt"]
+
+    od_hint = start_hint = None
+    if wlasna:
+        kto["jednostka"] = jednostka
+        kto["menedzer"] = menedzer
+        start_hint = _int_czas(info.get("ActiveEnterTimestamp"))
+        if info.get("FragmentPath") and _nowa(jednostka):
+            od_hint = od_jednostki(info["FragmentPath"])
+
+    rodzaj, powody, agent, sam_wstaje = rozstrzygnij({
+        "sam": sam, "agent_lancuch": lan["agent"], "agent_env": agent_env,
+        "powloka": lan["powloka"], "gospodarz": gospodarz, "gospodarz_z_lancucha": z_lancucha,
+        "terminal_env": terminal_env or lan["terminal"],
+        "jednostka": jednostka, "jednostka_wlasna": wlasna,
+        "jednostka_stala": info.get("UnitFileState") in STALE_STANY_JEDNOSTEK,
+        "jednostka_run": jednostka.startswith("run-"),
+        "menedzer": lan["menedzer"], "worktree": proj["worktree"],
+        "projekt": proj["projekt"], "istnieje": proj["istnieje"],
+    })
+    kto["agent"] = agent
+    return rodzaj, powody, kto, sam_wstaje, not proj["istnieje"], od_hint, start_hint, proj["korzen"]
+
+
+def klucz_procesu(korzen, proces, port):
+    """proc:<korzeń folderu>:<program>#<port>; bardzo długi korzeń skracamy skrótem."""
+    korzen = korzen or "-"
+    if len(korzen) > 120:
+        korzen = "…" + hashlib.sha1(korzen.encode("utf-8", "replace")).hexdigest()[:12] + "/" + os.path.basename(korzen)[:40]
+    return f"proc:{korzen}:{proces}#{port}"
+
+
+_NOWE_JEDNOSTKI = set()
+
+
+def _nowa(jednostka):
+    """Czas narodzin pliku jednostki czytamy tylko dla jednostek bez historii."""
+    return jednostka in _NOWE_JEDNOSTKI
+
+
+def _int_czas(tekst):
+    tekst = (tekst or "").lstrip("@")
+    return int(tekst) if tekst.isdigit() and int(tekst) > 0 else None
+
+
+# ── historia: od kiedy i restarty ───────────────────────────────────────────
+
+def aktualizuj_historie(hist, klucz, start, od_hint, teraz):
+    """Zwraca (od, start, restarty, zmieniono)."""
+    rec = hist.get(klucz)
+    zmiana = False
+    if not isinstance(rec, dict):
+        kandydaci = [t for t in (od_hint, start) if t]
+        rec = {"od": int(min(kandydaci) if kandydaci else teraz), "start": int(start or teraz),
+               "restarty": 0, "widziana": int(teraz)}
+        hist[klucz] = rec
+        return rec["od"], rec["start"], 0, True
+    if start:
+        poprzedni = rec.get("start") or 0
+        if start > poprzedni + 5:
+            if poprzedni:
+                rec["restarty"] = int(rec.get("restarty", 0)) + 1
+            rec["start"] = int(start)
+            zmiana = True
+    for t in (od_hint, start):
+        if t and t < rec.get("od", teraz):
+            rec["od"] = int(t)
+            zmiana = True
+    if teraz - rec.get("widziana", 0) > 3600:
+        rec["widziana"] = int(teraz)
+        zmiana = True
+    return rec["od"], rec.get("start"), int(rec.get("restarty", 0)), zmiana
+
+
+# ── nazwy i kolory własne ───────────────────────────────────────────────────
+
+def czysc_nazwe(tekst):
+    tekst = "".join(ch for ch in str(tekst) if not unicodedata.category(ch).startswith("C"))
+    return " ".join(tekst.split())[:MAKS_NAZWA]
+
+
+def ustawienia_wlasne():
+    """(nazwy, kolory) nadane przez użytkownika, oczyszczone i zweryfikowane."""
+    dane = czytaj_json(USTAWIENIA_PLIK, {})
+    nazwy = dane.get("nazwy") if isinstance(dane.get("nazwy"), dict) else {}
+    kolory = dane.get("kolory") if isinstance(dane.get("kolory"), dict) else {}
+    return ({str(k): czysc_nazwe(v) for k, v in nazwy.items() if czysc_nazwe(v)},
+            {str(k): v for k, v in kolory.items() if v in KOLORY})
+
+
+def ustaw_wlasne(pole, klucz, wartosc):
+    """pole: 'nazwy' | 'kolory'. Pusta wartość usuwa wpis (wraca automat)."""
+    klucz = str(klucz)
+    if not klucz or len(klucz) > MAKS_KLUCZ or any(unicodedata.category(ch).startswith("C") for ch in klucz):
+        raise ValueError("nieprawidłowy klucz usługi")
+    if pole == "nazwy":
+        wartosc = czysc_nazwe(wartosc)
+    else:
+        wartosc = str(wartosc).strip()
+        if wartosc and wartosc not in KOLORY:
+            raise ValueError("nieznany kolor; dostępne: " + ", ".join(KOLORY))
+    dane = czytaj_json(USTAWIENIA_PLIK, {})
+    wynik = {"v": 1}
+    for p in ("nazwy", "kolory"):
+        wynik[p] = dane.get(p) if isinstance(dane.get(p), dict) else {}
+    if wartosc:
+        wynik[pole][klucz] = wartosc
+    else:
+        wynik[pole].pop(klucz, None)
+    zapisz_json(USTAWIENIA_PLIK, wynik)
+    return wartosc
+
+
+# ── zbieranie ───────────────────────────────────────────────────────────────
+
 def zbierz():
+    global _NOWE_JEDNOSTKI, _PAMIEC_PROJEKTOW, _NOWA_PAMIEC
     nazwy = przyjazne_nazwy()
-    stan = stan_cache()
+    wlasne, kolory = ustawienia_wlasne()
+    agenci = dict(AGENCI, **agenci_uzytkownika())
+    cache = czytaj_json(CACHE, {})
+    if cache.get("v") == 2:
+        stan = czysc_cache(cache.get("cpu") if isinstance(cache.get("cpu"), dict) else {})
+        _PAMIEC_PROJEKTOW = czysc_pamiec(cache.get("projekty") if isinstance(cache.get("projekty"), dict) else {})
+    else:   # stary format: sam słownik CPU
+        stan, _PAMIEC_PROJEKTOW = czysc_cache(cache), {}
+    _NOWA_PAMIEC = {}
+    hist_dane = czytaj_json(HISTORIA, {})
+    hist_surowa = hist_dane.get("uslugi") if isinstance(hist_dane.get("uslugi"), dict) else {}
+    hist = czysc_historie(hist_surowa)
+    hist_zmiana = len(hist) != len(hist_surowa)
     teraz = time.time()
     uslugi = {}
 
-    def wstaw(port, nazwa, adres, zrodlo, srod, tech, pid, start_s, stan_proc):
-        cpu, mem, up = (None, None, None)
+    def wstaw(port, nazwa_auto, adres, zrodlo, srod, tech, pid, opis, klucz, pidy=()):
+        nonlocal hist_zmiana
+        cpu, mem, up, start_proc = (None, None, None, None)
         if pid:
-            cpu, mem, up = metryki(pid, stan_proc, teraz)
-        elif start_s:
-            up = start_s
+            cpu, mem, up, start_proc = metryki(pid, stan, teraz)
+            for inny in pidy:   # pozostałe procesy tego gniazda (workery)
+                if inny == pid:
+                    continue
+                c2, m2, _, _ = metryki(inny, stan, teraz)
+                if c2 is not None:
+                    cpu = round((cpu or 0) + c2, 1)
+                if m2 is not None:
+                    mem = round((mem or 0) + m2, 1)
+        start = opis.pop("start_hint", None) or start_proc
+        if up is None and start:
+            up = max(0, int(teraz - start))
+        od, start, restarty, zm = aktualizuj_historie(hist, klucz, start, opis.pop("od_hint", None), teraz)
+        hist_zmiana = hist_zmiana or zm
         tech_k, tech_p = tech if isinstance(tech, tuple) else (tech, "")
+        deklaracja = nazwy.get(port)
+        nazwa_mapy = deklaracja[0] if deklaracja and deklaracja[0] != "!" else ""
+        auto = nazwa_mapy or nazwa_auto
         uslugi[port] = {
-            "nazwa": nazwa, "url": f"http://{host_url(adres)}:{port}", "port": port,
+            "nazwa": wlasne.get(klucz) or auto, "nazwa_auto": auto,
+            "nazwa_wlasna": klucz in wlasne, "klucz": klucz, "kolor": kolory.get(klucz, ""),
+            "url": f"http://{host_url(adres)}:{port}", "port": port,
             "zrodlo": zrodlo, "srodowisko": srod, "tech": tech_k, "tech_param": tech_p,
             "cpu": cpu, "mem_mb": mem, "uptime_s": up, "adres": host_url(adres),
+            "od": od, "start": start, "restarty": restarty, **opis,
         }
 
-    for nazwa, adres, port, srod, tech, pid, start_s in kontenery():
-        wstaw(port, nazwa, adres, "docker", srod, tech, pid, start_s, stan)
+    for k in kontenery():
+        if k["port"] in uslugi:
+            continue   # ten sam port opublikowany na IPv4 i IPv6 — liczymy raz
+        kto = {"agent": "", "gospodarz": "Docker", "jednostka": "", "menedzer": "",
+               "compose": k["compose"], "projekt": "", "uzytkownik": ""}
+        powody = []
+        proj = projekt_info(k["katalog"]) if k["katalog"] else {"projekt": "", "worktree": False, "istnieje": True}
+        kto["projekt"] = proj["projekt"]
+        rodzaj = ""
+        if proj["worktree"]:
+            powody.append(["worktree", proj["projekt"]])
+            rodzaj = "test"
+        if not proj["istnieje"]:
+            powody.append(["osierocona", ""])
+        sam_wstaje = k["polityka"] in ("always", "unless-stopped")
+        if sam_wstaje:
+            powody.append(["docker-stala", k["polityka"]])
+            rodzaj = rodzaj or "stala"
+        else:
+            powody.append(["docker-reczna", ""])
+            rodzaj = rodzaj or "reczna"
+        opis = {"rodzaj": rodzaj, "powody": powody, "kto": kto, "sam_wstaje": sam_wstaje,
+                "osierocona": not proj["istnieje"], "od_hint": k["utworzony"], "start_hint": k["start"]}
+        wstaw(k["port"], k["nazwa"], k["adres"], "docker", "Docker", k["tech"], k["pid"], opis,
+              f"docker:{k['nazwa']}#{k['port']}")
 
-    for adres, port, proces, pid in gniazda():
+    kandydaci = []
+    for adres, port, proces, pid, pidy in gniazda():
         if port in uslugi or port in POMIJAJ_PORTY:
             continue
         deklaracja = nazwy.get(port)
@@ -302,48 +1222,133 @@ def zbierz():
             continue
         if proces in POMIJAJ_PROCESY:
             continue
+        kandydaci.append((adres, port, proces, pid, pidy, deklaracja))
+
+    # Jedno zapytanie do systemd na menedżer dla wszystkich jednostek naraz.
+    jednostki = set()
+    for adres, port, proces, pid, _, deklaracja in kandydaci:
+        if pid:
+            m, j = jednostka_z_cgroup(cgroup_tekst(pid))
+            if j:
+                jednostki.add((m, j))
+        elif deklaracja and len(deklaracja) > 1 and deklaracja[1].endswith(".service"):
+            jednostki.add(("system", deklaracja[1]))
+    znane = {str(k).split("#")[0] for k in hist}
+    _NOWE_JEDNOSTKI = {j for _, j in jednostki if f"unit:{j}" not in znane}
+    jednostki_info = info_jednostek(jednostki)
+
+    for adres, port, proces, pid, pidy, deklaracja in kandydaci:
         if proces is None:
             # Usługa roota/systemowa — tylko porty zadeklarowane w mapie.
             # 2. token mapy: jednostka systemd → metryki z /proc.
             if not deklaracja:
                 continue
-            nazwa = deklaracja[0]
             jednostka = deklaracja[1] if len(deklaracja) > 1 and deklaracja[1].endswith(".service") else None
             pid = pid_po_jednostce(jednostka)
-            tech = ("root-service", "")
+            info = jednostki_info.get(("system", jednostka), {}) if jednostka else {}
+            kto = {"agent": "", "gospodarz": "", "jednostka": jednostka or "", "menedzer": "system" if jednostka else "",
+                   "compose": "", "projekt": "", "uzytkownik": "root"}
+            opis = {"rodzaj": "stala", "powody": [["mapa", ""]], "kto": kto,
+                    "sam_wstaje": info.get("UnitFileState") in STALE_STANY_JEDNOSTEK,
+                    "osierocona": False, "start_hint": _int_czas(info.get("ActiveEnterTimestamp")),
+                    "od_hint": od_jednostki(info.get("FragmentPath")) if jednostka and _nowa(jednostka) else None}
             srod = "service" if pid else "root-service"
-            wstaw(port, nazwa, adres, "system", srod, tech, pid, None, stan)
+            wstaw(port, deklaracja[0], adres, "system", srod, ("root-service", ""), pid, opis,
+                  f"unit:{jednostka}#{port}" if jednostka else f"port#{port}")
             continue
+
         nazwa_auto, tech = nazwa_z_profilu(pid, proces)
         srod = srodowisko_procesu(pid)
+        env = srodowisko(pid)
         # Gosek: usługa w venv/dockerze rozpoznaje się po environ (drop-in)
-        env = environ_tekst(pid)
-        if "GOSEK_WHISPER=/home" in env and "deploy/docker" in env:
-            srod = "Docker"
-        elif "deploy/docker" in env:
+        if env["deploy_docker"]:
             srod = "Docker"
         # mapowy nadpis środowiska: `port nazwa [unit] [Docker|venv|Kubernetes|…]`
         if deklaracja:
             for tok in deklaracja[1:]:
                 if not tok.endswith(".service"):
                     srod = tok
-        wstaw(port, nazwy.get(port, [nazwa_auto])[0], adres,
-              zrodlo_procesu(pid), srod, tech, pid, None, stan)
+        rodzaj, powody, kto, sam_wstaje, osierocona, od_hint, start_hint, korzen = klasyfikuj_proces(
+            pid, agenci, jednostki_info, env)
+        if kto["jednostka"]:
+            klucz = f"unit:{kto['jednostka']}#{port}"
+            if tech[0] == "exe" and nazwa_auto == proces:
+                nazwa_auto = kto["jednostka"].rsplit(".", 1)[0]
+        else:
+            klucz = klucz_procesu(korzen, proces, port)
+        if rodzaj == "narzedzie" and kto["agent"] and tech[0] == "exe":
+            nazwa_auto = kto["agent"] + (f" · {kto['projekt']}" if kto["projekt"] else "")
+        elif rodzaj == "narzedzie" and kto["gospodarz"] and tech[0] == "exe":
+            nazwa_auto = f"{kto['gospodarz']} · {proces}"
+        elif tech[0] == "exe" and nazwa_auto == proces and kto["projekt"] and not kto["jednostka"]:
+            nazwa_auto = kto["projekt"]
+        opis = {"rodzaj": rodzaj, "powody": powody, "kto": kto, "sam_wstaje": sam_wstaje,
+                "osierocona": osierocona, "od_hint": od_hint, "start_hint": start_hint}
+        wstaw(port, nazwa_auto, adres, zrodlo_procesu(pid), srod, tech, pid, opis, klucz, pidy)
 
-    zapisz_cache({k: v for k, v in stan.items()
-                  if isinstance(v, list) and len(v) == 2})
+    zapisz_cache_cpu(stan, teraz, _NOWA_PAMIEC)
+    # Historia: porządki raz na zapis — wpisy niewidziane od HISTORIA_DNI dni wypadają.
+    granica = teraz - HISTORIA_DNI * 86400
+    for k in [k for k, v in hist.items() if v.get("widziana", 0) < granica]:
+        del hist[k]
+        hist_zmiana = True
+    if hist_zmiana:
+        try:
+            zapisz_json(HISTORIA, {"v": 1, "uslugi": hist})
+        except OSError:
+            pass
     return sorted(uslugi.values(), key=lambda u: (u["zrodlo"] != "docker", u["port"]))
 
 
-def zrodlo_procesu(pid):
-    if "venv" in cmdline_tekst(pid):
-        return "venv"
-    return "proces"
+def _liczba(v):
+    """Skończona liczba (NaN/Infinity z ręcznej edycji pliku też odpadają)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def czysc_cache(stan):
+    """Tylko poprawne wpisy {pid: [takty, czas]} — zepsuty plik nie psuje skanu."""
+    return {str(k): v for k, v in stan.items()
+            if isinstance(v, list) and len(v) == 2 and _liczba(v[0]) and _liczba(v[1])}
+
+
+def czysc_historie(hist):
+    """Tylko poprawne wpisy historii; zły typ pola = wpis od nowa, nie awaria."""
+    wynik = {}
+    for k, v in hist.items():
+        if (isinstance(v, dict) and all(_liczba(v.get(p)) for p in ("od", "start", "widziana"))
+                and _liczba(v.get("restarty", 0))):
+            wynik[str(k)] = v
+    return wynik
+
+
+def zapisz_cache_cpu(stan, teraz, projekty=None):
+    # Zostają tylko pidy odczytane w ostatnich minutach — reszta to martwe procesy
+    # (plik nie rośnie bez końca, a ponownie użyty pid nie da fałszywego skoku CPU).
+    # Pamięć projektów: tylko procesy widziane w tym skanie.
+    swieze = {k: v for k, v in czysc_cache(stan).items() if v[1] >= teraz - 300}
+    try:
+        zapisz_json(CACHE, {"v": 2, "cpu": swieze, "projekty": czysc_pamiec(projekty or {})}, wciecie=None)
+    except OSError:
+        pass
 
 
 def main():
     global BTIME
     BTIME = btime()
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("nazwa", "kolor"):
+        pole = "nazwy" if argv[0] == "nazwa" else "kolory"
+        if len(argv) < 2:
+            print(json.dumps({"ok": False, "error": f"użycie: uslugi-www-stan {argv[0]} KLUCZ [WARTOŚĆ…]"},
+                             ensure_ascii=False))
+            sys.exit(2)
+        try:
+            wartosc = ustaw_wlasne(pole, argv[1], " ".join(argv[2:]))
+        except (ValueError, OSError) as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            sys.exit(1)
+        print(json.dumps({"ok": True, "klucz": argv[1], argv[0]: wartosc}, ensure_ascii=False))
+        return
     try:
         uslugi = zbierz()
         print(json.dumps({"ok": True, "uslugi": uslugi,

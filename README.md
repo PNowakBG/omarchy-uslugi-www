@@ -35,6 +35,74 @@ Remove: `omarchy plugin remove pablo.uslugi` (then
 | sort by name / CPU / RAM | buttons in the panel, or keys `n` / `c` / `m` |
 | compact ↔ detailed view | link next to sort, or key `d` |
 | refresh | key `r`, middle-click, or the ↻ button |
+| show only one kind (permanent / tests / manual / tools) | the *Show:* row, or key `f` |
+| rename a service | the pencil 󰏫 next to its name (Enter saves, Esc cancels, empty restores the automatic name) |
+| colour a service | the dot ○ before its name, then a colour (or *no colour*) |
+
+## Who exposed it, and is it permanent?
+
+Every service carries a **kind** badge and three extra lines in the detailed view:
+
+- **PERMANENT** — a systemd unit that starts on its own, a Docker container with
+  restart policy `always`/`unless-stopped`, a root service from the map, or a
+  process kept alive by pm2/supervisord,
+- **AGENT TEST** / **TEST** — started by a coding agent, or from a git
+  worktree; flagged in red when its folder no longer exists (orphaned leftovers),
+- **MANUAL** — started by hand from a shell,
+- **TOOL** — a coding agent's own port, or a server of the tool hosting it.
+
+`by:` names the agent and its host (*Claude Code in herdr*), the systemd unit or
+compose project, the project/worktree and the user. `exposed since … · last
+start … · restarts: N` comes from the unit file / package install date / container
+creation, the last (re)start, and restarts seen by the scanner
+(`~/.local/state/uslugi-www/historia.json`, kept 30 days). `why:` lists the
+evidence behind the badge.
+
+Detection is generic — it does not assume a particular terminal or agent
+manager. It was tested with herdr, tmux and a plain terminal; Rex, T3 Code,
+Zellij, WezTerm, kitty and others go through the same rules (not tested here):
+
+1. the whole parent chain up to the session boundary: the nearest known coding
+   agent (Claude Code — also via the Agent SDK used by T3 Code and similar apps —
+   Codex, Gemini CLI, OpenCode, Kimi Code, Cursor Agent, pi, omp, Grok, Copilot,
+   Amp, Aider, …), a shell, and the first real program above them — shells and
+   runners (`node`, `npm`, `uv`, …) are skipped, an unknown program in between
+   (e.g. a dev-server reloader) does not hide an agent further up, and an
+   unknown host is shown under its own name,
+2. when the chain is broken (`nohup`, `setsid`, daemons): the oldest real process
+   in the same systemd cgroup, which a process cannot leave; a detached process
+   that carries a terminal environment (`TERM`) counts as **MANUAL**,
+3. agent session markers in the environment: known names (`CLAUDECODE`,
+   `KIMI_CODE_SESSION_ID`, `OPENCODE`, `GEMINI_CLI`, …), the convention
+   `<AGENT>_SESSION_ID` / `_THREAD_ID` for any known agent, and `AI_AGENT`.
+   Only variable **names** are used; the only values looked at are
+   `TERM_PROGRAM` and `AI_AGENT` (a terminal / agent name, shortened) and whether
+   a path contains `deploy/docker` — no other value is read into the output.
+   Variables set for the whole session (`systemctl --user show-environment`)
+   are ignored,
+4. systemd: a service counts as the unit's own (PERMANENT when enabled) only if
+   it is the unit's main process or its child with no agent and no terminal on
+   the way; container units (the Hyprland session, a tmux/foot server, desktop
+   apps) never make a service permanent,
+5. the working directory: git repository, linked worktree (`*-wt/…`,
+   `.claude/worktrees/…`, `~/.codex/worktrees/…`), or a deleted folder.
+
+Teach it another agent in `~/.config/uslugi-www/agenci.conf`, one per line:
+
+```text
+# process-name  Display Name
+myagent  My Agent
+```
+
+Names and colours set in the panel live in `~/.config/uslugi-www/uslugi.json`
+(keyed by a stable id: container, systemd unit, or the root folder of the
+project/worktree + program, plus port — so a name and colour survive restarts
+and the deletion of the worktree folder or of a rebuilt subfolder such as `dist/`;
+the scanner remembers each running process's project root while its folder exists).
+From a terminal: `uslugi-www-stan nazwa KEY "Name"` / `uslugi-www-stan kolor KEY
+zielony` (an empty value restores the default). Colours: `czerwony`,
+`pomaranczowy`, `zolty`, `zielony`, `turkusowy`, `niebieski`, `fioletowy`,
+`rozowy`, `szary`.
 
 **Detailed view** shows URL, the exact technology (e.g. `docker compose:
 dockge`, `systemd: gosek-panel.service (--user)`) and a 12-sample CPU
@@ -101,7 +169,8 @@ run containers.
 - `Panel.qml` — bar widget + dropdown panel,
 - `bin/uslugi-www-stan` — the scanner (python3, stdlib only),
 - `install.sh` — idempotent symlink of the scanner into `~/.local/bin`,
-- `local-www.map.example` — commented example of the port map.
+- `local-www.map.example` — commented example of the port map,
+- `tests/test_skaner.py` — scanner tests: `python3 -I -B -m unittest discover -s tests`.
 
 ## License
 
@@ -123,4 +192,13 @@ omarchy plugin add https://github.com/PNowakBG/omarchy-uslugi-www --enable
 - widok zwięzły ↔ pełny (klawisz `d`),
 - przyjazne nazwy i ukrywanie portów: `~/.config/local-www.map`
   (format: `port nazwa [unit] [środowisko]`, `!` ukrywa),
+- odznaka rodzaju: **STAŁA** (systemd / Docker sam ją uruchamia), **TEST AGENTA**
+  / **TEST** (uruchomił ją agent kodujący albo pochodzi z worktree; na czerwono,
+  gdy jej folder już nie istnieje), **RĘCZNA**, **NARZĘDZIE**; filtr klawiszem `f`,
+- linie „kto”, „wystawiona od · ostatni start · restartów” i „dlaczego”;
+  rozpoznawanie jest ogólne (sprawdzone w herdr, tmux i zwykłym terminalu;
+  Rex, T3 Code, Zellij i inne przechodzą przez te same reguły),
+- ołówek 󰏫 zmienia nazwę wyświetlaną, kropka ○ nadaje kolor (pasek z lewej
+  strony wiersza); zapis w `~/.config/uslugi-www/uslugi.json`,
+- własni agenci: `~/.config/uslugi-www/agenci.conf` (`proces Nazwa`).
 - język polski wchodzi automatycznie przy `LANG=pl_*`.

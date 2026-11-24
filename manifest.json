@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "pablo.uslugi",
   "name": "Local Web Services",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "pablo",
-  "description": "Local web services (Docker/venv/system services) with ports, CPU/RAM, uptime — click opens the browser. PL/EN auto.",
+  "description": "Local web services (Docker/venv/system services) with ports, CPU/RAM, uptime — and who exposed each one (coding agent, terminal, systemd, Docker), whether it is permanent or an agent's test, since when and the last restart. Rename and colour services. Click opens the browser. PL/EN auto.",
   "kinds": [
     "bar-widget"
   ],
