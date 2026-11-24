@@ -47,7 +47,26 @@ Every service carries a **kind** badge and three extra lines in the detailed vie
   restart policy `always`/`unless-stopped`, a root service from the map, or a
   process kept alive by pm2/supervisord,
 - **AGENT TEST** / **TEST** — started by a coding agent, or from a git
-  worktree; flagged in red when its folder no longer exists (orphaned leftovers),
+  worktree; flagged in red when its folder no longer exists (orphaned leftovers).
+  A Docker Compose stack started from a worktree is the project's shared stack,
+  not a test, when the main checkout would give it the same Compose project
+  name — same project name means the same volumes and network. The main
+  checkout must have at least one of the stack's compose files, and the name
+  must match in every typical way of starting it there: the same command as in
+  the worktree (compose files, env files and project directory from the
+  container labels, moved to the main checkout; worktree-only files are
+  skipped), and — when the labels look like a plain `docker compose up` — also
+  the plain command, which auto-loads a local override and `COMPOSE_FILE` from
+  `.env`. The name is worked out like Compose does: `COMPOSE_PROJECT_NAME` from
+  the env files (last value wins), then the last `name:`, then the normalised
+  project folder name. Variables in `name:` are substituted like Compose does
+  (`${X:-default}`, `${X-default}`, `${X}`, `$X`, values from the same env
+  files), so `name: ${COMPOSE_PROJECT_NAME:-dms}` counts as `dms`. A variable
+  with no value and no default, other syntax, or an env file that is a pipe or
+  unreadable is not guessed at (the stack stays a test). Variables set only in
+  your shell are invisible to the scanner. It shows the main project and where
+  the stack was last started from. A worktree that brought up its own project
+  (another name, `-p`) stays a test even if the container names match,
 - **MANUAL** — started by hand from a shell,
 - **TOOL** — a coding agent's own port, or a server of the tool hosting it.
 
@@ -163,6 +182,9 @@ Omarchy (or any Omarchy-shell setup) with `python3`, `ss` (iproute2) and
 `omarchy-launch-browser`. `docker` is optional — only needed if you actually
 run containers.
 
+The scanner reads only regular files (never waits on a pipe) and stops itself
+after 60 s with an error, so a stuck scan cannot freeze the panel.
+
 ## Files
 
 - `manifest.json` — plugin manifest (id `pablo.uslugi`, bar-widget),
@@ -194,7 +216,9 @@ omarchy plugin add https://github.com/PNowakBG/omarchy-uslugi-www --enable
   (format: `port nazwa [unit] [środowisko]`, `!` ukrywa),
 - odznaka rodzaju: **STAŁA** (systemd / Docker sam ją uruchamia), **TEST AGENTA**
   / **TEST** (uruchomił ją agent kodujący albo pochodzi z worktree; na czerwono,
-  gdy jej folder już nie istnieje), **RĘCZNA**, **NARZĘDZIE**; filtr klawiszem `f`,
+  gdy jej folder już nie istnieje), **RĘCZNA**, **NARZĘDZIE**; filtr klawiszem `f`;
+  stos compose uruchomiony z worktree, który w głównym repo dostałby tę samą nazwę
+  projektu compose (te same wolumeny), to wspólny stos projektu, nie test,
 - linie „kto”, „wystawiona od · ostatni start · restartów” i „dlaczego”;
   rozpoznawanie jest ogólne (sprawdzone w herdr, tmux i zwykłym terminalu;
   Rex, T3 Code, Zellij i inne przechodzą przez te same reguły),

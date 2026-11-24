@@ -4,11 +4,14 @@ Uruchomienie z katalogu wtyczki:
     python3 -I -B -m unittest discover -s tests -v
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -329,6 +332,297 @@ class SladyAgentow(unittest.TestCase):
         self.assertEqual(S.agent_ze_srodowiska(e, self.AGENCI, set())[0], "OpenCode")
         e = self.env("AI_AGENT", ai="nowyagent_1.2")
         self.assertEqual(S.agent_ze_srodowiska(e, self.AGENCI, set())[0], "nowyagent")
+
+
+class StosProjektu(unittest.TestCase):
+    """Stos compose uruchomiony z worktree vs zdefiniowany w głównym repo."""
+
+    COMPOSE = "name: crm\nservices:\n  db:\n    image: postgres\n    container_name: crm-postgres\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home_stary = S.HOME
+        S.HOME = self.tmp.name
+        self.projekty = os.path.join(self.tmp.name, "Projects")
+        self.glowny = os.path.join(self.projekty, "CRM", "docker", "docker-compose.yml")
+        os.makedirs(os.path.join(self.projekty, "CRM", ".git"))
+        os.makedirs(os.path.dirname(self.glowny))
+
+    def tearDown(self):
+        S.HOME = self.home_stary
+        self.tmp.cleanup()
+
+    def zapisz_glowny(self, tekst):
+        with open(self.glowny, "w", encoding="utf-8") as f:
+            f.write(tekst)
+
+    def wt_plik(self, wt="feature-login", podkatalog="docker"):
+        return os.path.join(self.projekty, "CRM-wt", wt, podkatalog, "docker-compose.yml")
+
+    def test_usuniety_worktree_ten_sam_projekt(self):
+        self.zapisz_glowny(self.COMPOSE)
+        plik = self.wt_plik()
+        self.assertEqual(S.glowny_odpowiednik(plik), (self.glowny, "CRM"))
+        self.assertEqual(S.stos_projektu(plik, "crm"), "CRM")
+
+    def test_zywy_worktree_przez_plik_git(self):
+        self.zapisz_glowny(self.COMPOSE)
+        wt = os.path.join(self.projekty, "CRM-wt-koordynacja")
+        os.makedirs(os.path.join(wt, "docker"))
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write(f"gitdir: {self.projekty}/CRM/.git/worktrees/koordynacja\n")
+        plik = os.path.join(wt, "docker", "docker-compose.yml")
+        with open(plik, "w") as f:
+            f.write(self.COMPOSE)
+        self.assertEqual(S.stos_projektu(plik, "crm"), "CRM")
+
+    def test_zywy_worktree_wzgledny_gitdir(self):
+        # git worktree.useRelativePaths: gitdir względem folderu worktree
+        self.zapisz_glowny(self.COMPOSE)
+        wt = os.path.join(self.projekty, "CRM-wt", "rel")
+        os.makedirs(os.path.join(wt, "docker"))
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write("gitdir: ../../CRM/.git/worktrees/rel\n")
+        plik = os.path.join(wt, "docker", "docker-compose.yml")
+        with open(plik, "w") as f:
+            f.write(self.COMPOSE)
+        self.assertEqual(S.glowny_odpowiednik(plik), (self.glowny, "CRM"))
+        self.assertEqual(S.stos_projektu(plik, "crm"), "CRM")
+
+    def test_usuniety_worktree_claude_w_zywym_repo(self):
+        self.zapisz_glowny(self.COMPOSE)
+        plik = os.path.join(self.projekty, "CRM", ".claude", "worktrees", "x", "docker", "docker-compose.yml")
+        self.assertEqual(S.glowny_odpowiednik(plik), (self.glowny, "CRM"))
+
+    def test_inny_projekt_compose_to_test_worktree(self):
+        # worktree odpala własny stos (inna nazwa projektu) — to jest test
+        self.zapisz_glowny(self.COMPOSE)
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-feature-login"), "")
+
+    def test_ta_sama_nazwa_kontenera_inny_projekt_to_test(self):
+        # Ten sam container_name, ale inny projekt compose = inne wolumeny i sieć,
+        # czyli osobna baza worktree. Zgodność nazwy kontenera nic nie dowodzi.
+        self.zapisz_glowny("services:\n  db:\n    container_name: crm-postgres\n")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "fala-3"), "")
+        self.zapisz_glowny(self.COMPOSE)   # -p fala3 przy name: crm
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "fala3"), "")
+
+    def test_wzmianka_pod_innym_kluczem_nie_liczy_sie(self):
+        self.zapisz_glowny("x-notes:\n  container_name: shop-db\nservices: {}\n")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "feat-shop"), "")
+
+    def test_domyslna_nazwa_z_folderu_po_normalizacji(self):
+        # bez name: Compose bierze nazwę folderu: małe litery, bez kropek itp.
+        glowny = os.path.join(self.projekty, "CRM", "My.App", "docker-compose.yml")
+        os.makedirs(os.path.dirname(glowny))
+        with open(glowny, "w") as f:
+            f.write("services:\n  db:\n    image: postgres\n")
+        plik = os.path.join(self.projekty, "CRM-wt", "f", "My.App", "docker-compose.yml")
+        self.assertEqual(S.stos_projektu(plik, "myapp"), "CRM")
+        self.assertEqual(S.stos_projektu(plik, "f"), "")
+
+    def test_nazwa_z_env_ma_pierwszenstwo(self):
+        self.zapisz_glowny(self.COMPOSE)
+        with open(os.path.join(os.path.dirname(self.glowny), ".env"), "w") as f:
+            f.write("# dev\nCOMPOSE_PROJECT_NAME=crm-dev\n")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-dev"), "CRM")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "")
+
+    def test_zmienna_z_domyslna_w_name_jak_compose(self):
+        # Compose: `${X:-crm}` bez X w plikach env = `crm`
+        self.zapisz_glowny("name: ${PROJEKT:-crm}\nservices: {}\n")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "CRM")
+        with open(os.path.join(os.path.dirname(self.glowny), ".env"), "w") as f:
+            f.write("PROJEKT=crm-lokalny\n")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-lokalny"), "CRM")
+
+    def test_zmienna_bez_wartosci_nie_zgaduje(self):
+        for name in ("${PROJEKT}", "$PROJEKT", "${PROJEKT:?brak}", "${PROJEKT:+crm}",
+                     "${PROJEKT:-${INNY}}", "${PROJEKT:-}"):
+            with self.subTest(name=name):
+                self.zapisz_glowny(f"name: {name}\nservices: {{}}\n")
+                self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "")
+
+    def test_interpolacja(self):
+        env = os.path.join(self.tmp.name, "a.env")
+        with open(env, "w") as f:
+            f.write("A=crm\nPUSTA=\n")
+        self.assertEqual(S.interpoluj("${A}-dev", [env]), "crm-dev")
+        self.assertEqual(S.interpoluj("$A", [env]), "crm")
+        self.assertEqual(S.interpoluj("${PUSTA:-x}", [env]), "x")
+        self.assertEqual(S.interpoluj("${PUSTA-x}y", [env]), "y")
+        self.assertEqual(S.interpoluj("${BRAK-x}", [env]), "x")
+        self.assertEqual(S.interpoluj("a$$b", [env]), "a$b")
+
+    def test_uklad_dms(self):
+        # DMS: name: ${COMPOSE_PROJECT_NAME:-dms}; npm: docker compose --env-file .env
+        # --env-file compose-profiles.env -f docker/docker-compose.yml up
+        glowny = os.path.join(self.projekty, "DMS", "docker", "docker-compose.yml")
+        os.makedirs(os.path.dirname(glowny))
+        os.makedirs(os.path.join(self.projekty, "DMS", ".git"))
+        with open(glowny, "w") as f:
+            f.write("name: ${COMPOSE_PROJECT_NAME:-dms}\nservices: {}\n")
+        wt = os.path.join(self.projekty, "DMS-wt", "agent-x")
+        pliki = os.path.join(wt, "docker", "docker-compose.yml")
+        envy = os.path.join(wt, ".env") + "," + os.path.join(wt, "compose-profiles.env")
+        katalog = os.path.join(wt, "docker")
+        self.assertEqual(S.stos_projektu(pliki, "dms", katalog, envy), "DMS")
+        self.assertEqual(S.stos_projektu(pliki, "dms-agent-x", katalog, envy), "")
+        with open(os.path.join(self.projekty, "DMS", ".env"), "w") as f:
+            f.write("COMPOSE_PROJECT_NAME=dms-glowny\n")
+        self.assertEqual(S.stos_projektu(pliki, "dms", katalog, envy), "")
+
+    def test_wzgledna_sciezka_z_etykiety(self):
+        self.zapisz_glowny(self.COMPOSE)
+        katalog = os.path.dirname(self.wt_plik())
+        self.assertEqual(S.stos_projektu("docker-compose.yml", "crm", katalog), "CRM")
+        self.assertEqual(S.stos_projektu("docker-compose.yml", "crm"), "")
+
+    def test_kilka_plikow_jak_jeden_projekt(self):
+        # Compose łączy pliki w jeden projekt; `name:` z późniejszego pliku wygrywa
+        self.zapisz_glowny(self.COMPOSE)
+        override = os.path.join(os.path.dirname(self.glowny), "compose.override.yml")
+        with open(override, "w") as f:
+            f.write("name: crm-ov\n")
+        pliki = self.wt_plik() + "," + os.path.join(os.path.dirname(self.wt_plik()), "compose.override.yml")
+        self.assertEqual(S.stos_projektu(pliki, "crm-ov"), "CRM")
+        self.assertEqual(S.stos_projektu(pliki, "crm"), "")
+        # override tylko w worktree, który nazwę zmienia — to własny projekt worktree
+        os.remove(override)
+        self.assertEqual(S.stos_projektu(pliki, "crm-ov"), "")
+
+    def test_override_tylko_w_worktree_bez_zmiany_nazwy_to_wspolne_dane(self):
+        # np. override zmieniający tylko porty: projekt „crm” = te same wolumeny co
+        # w głównym — oznaczenie TEST mogłoby skłonić do `down -v` na prawdziwej bazie
+        self.zapisz_glowny(self.COMPOSE)
+        pliki = self.wt_plik() + "," + os.path.join(os.path.dirname(self.wt_plik()), "compose.override.yml")
+        self.assertEqual(S.stos_projektu(pliki, "crm"), "CRM")
+
+    def test_lokalny_override_w_glownym_zmienia_nazwe(self):
+        # główny ma (nieśledzony) compose.override.yaml z name: crm-local, a worktree nie;
+        # zwykłe `docker compose up` w głównym da crm-local, więc stos „crm” to test
+        self.zapisz_glowny(self.COMPOSE)
+        with open(os.path.join(os.path.dirname(self.glowny), "compose.override.yaml"), "w") as f:
+            f.write("name: crm-local\n")
+        katalog = os.path.dirname(self.wt_plik())
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog), "")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-local", katalog), "")
+        # jawne -f/--env-file (skrypt): główny startuje tym samym poleceniem, bez auto-override
+        env_wt = os.path.join(self.projekty, "CRM-wt", "feature-login", ".env")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog, env_wt), "CRM")
+
+    def test_compose_file_w_env_glownego(self):
+        self.zapisz_glowny(self.COMPOSE)
+        katalog_glowny = os.path.dirname(self.glowny)
+        with open(os.path.join(katalog_glowny, ".env"), "w") as f:
+            f.write("COMPOSE_FILE=docker-compose.yml:dev.yaml\n")
+        with open(os.path.join(katalog_glowny, "dev.yaml"), "w") as f:
+            f.write("name: crm-dev\n")
+        katalog = os.path.dirname(self.wt_plik())
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog), "")
+        with open(os.path.join(katalog_glowny, ".env"), "w") as f:
+            f.write("COMPOSE_FILE=${PLIKI}\n")   # nie zgadujemy
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog), "")
+
+    def test_wywolanie_domyslne(self):
+        k = "/p/wt/docker"
+        self.assertTrue(S.wywolanie_domyslne([k + "/compose.yaml"], k, []))
+        self.assertTrue(S.wywolanie_domyslne([k + "/docker-compose.yml", k + "/compose.override.yml"],
+                                             k, [k + "/.env"]))
+        self.assertFalse(S.wywolanie_domyslne([k + "/dev.yaml"], k, []))
+        self.assertFalse(S.wywolanie_domyslne([k + "/compose.yaml"], k, ["/p/wt/.env"]))
+        self.assertFalse(S.wywolanie_domyslne([k + "/compose.yaml"], "/p/wt", []))
+
+    def bez_zawieszenia(self, fn, *argumenty):
+        def stop(_s, _r):
+            raise AssertionError("skaner zawiesił się na czytaniu pliku")
+        stary = signal.signal(signal.SIGALRM, stop)
+        signal.alarm(5)
+        try:
+            return fn(*argumenty)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, stary)
+
+    def test_env_jako_potok_nie_zawiesza(self):
+        # np. .env wystawiony przez menedżer sekretów jako named pipe bez piszącego
+        self.zapisz_glowny(self.COMPOSE)
+        os.mkfifo(os.path.join(os.path.dirname(self.glowny), ".env"))
+        self.assertEqual(self.bez_zawieszenia(S.stos_projektu, self.wt_plik(), "crm"), "")
+
+    def test_compose_jako_potok_nie_zawiesza(self):
+        os.mkfifo(self.glowny)
+        self.assertEqual(self.bez_zawieszenia(S.stos_projektu, self.wt_plik(), "crm"), "")
+
+    def test_env_jako_katalog_pomijany(self):
+        self.zapisz_glowny(self.COMPOSE)
+        os.mkdir(os.path.join(os.path.dirname(self.glowny), ".env"))
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "CRM")
+
+    def test_env_z_etykiety_environment_file(self):
+        # `docker compose --env-file .env -f docker/docker-compose.yml` z korzenia repo
+        self.zapisz_glowny(self.COMPOSE)
+        with open(os.path.join(self.projekty, "CRM", ".env"), "w") as f:
+            f.write("COMPOSE_PROJECT_NAME=crm-local\n")
+        wt = os.path.join(self.projekty, "CRM-wt", "feature-login")
+        env_wt, katalog = os.path.join(wt, ".env"), os.path.join(wt, "docker")
+        # worktree bez tej zmiennej dało projekt „crm”, główny dałby „crm-local” — test
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog, env_wt), "")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-local", katalog, env_wt), "CRM")
+        # bez --env-file Compose czyta .env z katalogu projektu (docker/), nie z korzenia
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm", katalog), "CRM")
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm-local", katalog), "")
+
+    def test_env_czytany_jak_w_compose(self):
+        self.zapisz_glowny(self.COMPOSE)
+        env = os.path.join(os.path.dirname(self.glowny), ".env")
+        for tresc, oczekiwana in (
+                ("COMPOSE_PROJECT_NAME=crm\nCOMPOSE_PROJECT_NAME=crm-local\n", "crm-local"),
+                ("COMPOSE_PROJECT_NAME: crm-local\n", "crm-local"),
+                ("﻿COMPOSE_PROJECT_NAME=crm-local\n", "crm-local"),
+                ("export COMPOSE_PROJECT_NAME = 'crm-local' # lokalnie\r\n", "crm-local"),
+                ('COMPOSE_PROJECT_NAME="crm-local"\n', "crm-local"),
+                ("#COMPOSE_PROJECT_NAME=inna\nCOMPOSE_PROJECT_NAME_X=inna\n", "crm")):
+            with self.subTest(tresc=tresc):
+                with open(env, "w", encoding="utf-8", newline="") as f:
+                    f.write(tresc)
+                for etykieta in ("crm", "crm-local"):
+                    self.assertEqual(S.stos_projektu(self.wt_plik(), etykieta),
+                                     "CRM" if etykieta == oczekiwana else "")
+
+    def test_brak_pliku_w_glownym_repo(self):
+        self.assertEqual(S.stos_projektu(self.wt_plik(), "crm"), "")
+
+    def test_glowny_checkout_to_nie_worktree(self):
+        self.zapisz_glowny(self.COMPOSE)
+        self.assertEqual(S.glowny_odpowiednik(self.glowny), (None, ""))
+        self.assertEqual(S.glowny_odpowiednik("/srv/stos/compose.yml"), (None, ""))
+
+
+class LimitSkanu(unittest.TestCase):
+    """Zawieszony skan nie może zamrozić panelu: po LIMIT_SKANU kończy się błędem."""
+
+    def test_zawieszony_skan_konczy_sie_bledem(self):
+        stare = (S.LIMIT_SKANU, S.zbierz, sys.argv)
+        S.LIMIT_SKANU = 1
+        S.zbierz = lambda: time.sleep(10)
+        sys.argv = ["uslugi-www-stan", "status"]
+        wyjscie = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(wyjscie), self.assertRaises(SystemExit) as wynik:
+                S.main()
+        finally:
+            S.LIMIT_SKANU, S.zbierz, sys.argv = stare
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        self.assertEqual(wynik.exception.code, 1)
+        dane = json.loads(wyjscie.getvalue())
+        self.assertFalse(dane["ok"])
+        self.assertIn("1 s", dane["error"])
+
+    def test_limit_nie_jest_polykany_przez_except_oserror(self):
+        self.assertFalse(issubclass(S.PrzekroczonyCzas, Exception))
 
 
 class Rozstrzyganie(unittest.TestCase):

@@ -62,6 +62,8 @@ import math
 import os
 import pwd
 import re
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -799,6 +801,309 @@ def projekt_info(sciezka):
     return wynik
 
 
+def glowny_odpowiednik(sciezka):
+    """Ścieżka w worktree → (ta sama ścieżka w głównym checkoucie repo, nazwa repo)
+    albo (None, ''). Działa dla żywego worktree (plik .git → gitdir) i dla
+    usuniętego (z układu ścieżki: <repo>-wt/<wt>, <repo>/.claude/worktrees/<wt>,
+    ~/.codex/worktrees/<id>/<repo>, ~/.t3/worktrees/<repo>/<gałąź>)."""
+    cur = sciezka if os.path.exists(sciezka) else ""
+    for _ in range(25):   # żywy worktree: najbliższy plik .git
+        if cur in (HOME, "/", ""):
+            break
+        git = os.path.join(cur, ".git")
+        if os.path.isfile(git):
+            try:
+                with open(git, encoding="utf-8") as f:
+                    m = re.match(r"gitdir:\s*(.+?)/\.git/worktrees/", f.read())
+            except OSError:
+                m = None
+            if m:
+                # gitdir bywa względny (git worktree.useRelativePaths) — względem worktree
+                glowny = os.path.normpath(os.path.join(cur, m.group(1)))
+                return glowny + sciezka[len(cur):], os.path.basename(glowny)
+            break
+        if os.path.isdir(git):
+            return None, ""   # to główny checkout, nie worktree
+        cur = os.path.dirname(cur)
+    projekty = os.path.join(HOME, "Projects") + "/"
+    m = WT_W_SCIEZCE.match(sciezka)
+    if m:
+        baza, wt, dalej = m.group("baza"), m.group("wt"), m.group("dalej")
+        koniec = sciezka[:m.end("wt")]
+        if baza == HOME:
+            if not dalej:
+                return None, ""
+            repo = dalej if re.fullmatch(r"[0-9a-f]{4,}|[0-9]+", wt) else wt
+            korzen, glowny = koniec + "/" + dalej, projekty + repo
+        else:
+            korzen, glowny, repo = koniec, baza, os.path.basename(baza)
+    elif sciezka.startswith(projekty):
+        czesci = sciezka[len(projekty):].split("/")
+        if len(czesci) < 2 or not czesci[0].endswith("-wt"):
+            return None, ""
+        repo = czesci[0][:-3]
+        korzen, glowny = projekty + czesci[0] + "/" + czesci[1], projekty + repo
+    else:
+        return None, ""
+    if sciezka != korzen and not sciezka.startswith(korzen + "/"):
+        return None, ""
+    return glowny + sciezka[len(korzen):], repo
+
+
+def nazwa_projektu_compose(nazwa):
+    """Normalizacja jak w Docker Compose: małe litery, tylko [a-z0-9_-],
+    bez wiodących '-' i '_' (np. 'My.App' → 'myapp')."""
+    return re.sub(r"[^a-z0-9_-]", "", nazwa.lower()).lstrip("-_")
+
+
+def czytaj_zwykly(sciezka, limit=256 * 1024):
+    """Tekst zwykłego pliku (najwyżej `limit` bajtów, bez BOM) albo None.
+    Potok (FIFO), gniazdo, urządzenie, katalog → None od razu: otwarcie
+    z O_NONBLOCK nie czeka na piszącego, a fstat odrzuca wszystko poza
+    zwykłym plikiem — skaner nigdy nie zawiśnie na czytaniu."""
+    try:
+        fd = os.open(sciezka, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        czesci, zostalo = [], limit
+        while zostalo > 0:
+            kawalek = os.read(fd, min(zostalo, 65536))
+            if not kawalek:
+                break
+            czesci.append(kawalek)
+            zostalo -= len(kawalek)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(czesci).decode("utf-8-sig", errors="replace")
+
+
+def wartosc_env(tekst, klucz):
+    """Wartość klucza z pliku .env tak, jak czyta go Compose: `KLUCZ=wartość`
+    albo `KLUCZ: wartość`, opcjonalne `export`, cudzysłowy, komentarz po
+    odstępie i `#`; przy powtórzonym kluczu wygrywa ostatni wpis. None = brak."""
+    wynik = None
+    for linia in tekst.splitlines():
+        m = re.match(r"\s*(?:export\s+)?" + re.escape(klucz) + r"\s*[=:]\s*(.*)$", linia)
+        if not m:
+            continue
+        v = m.group(1).strip()
+        if v[:1] in ("'", '"'):
+            koniec = v.find(v[0], 1)
+            v = v[1:koniec] if koniec > 0 else v[1:]
+        else:
+            v = re.split(r"\s#", v, maxsplit=1)[0].strip()
+        wynik = v
+    return wynik
+
+
+class Nieustalone(Exception):
+    """Nie da się ustalić bez zgadywania (potok, brak praw, zmienna `$…`)."""
+
+
+def zmienna_env(pliki_env, klucz):
+    """Wartość klucza z plików env w kolejności (ostatnia wygrywa) albo None.
+    Nieistniejący plik i katalog są pomijane: w głównym checkoucie taki plik
+    po prostu nie ustawia klucza (jawne `--env-file` na brakujący plik Compose
+    by odrzucił — zakładamy, że człowiek utworzy go z tymi samymi kluczami,
+    co w worktree, albo bez nich; to jawne założenie, nie zachowanie Compose).
+    Plik, którego nie da się bezpiecznie przeczytać → Nieustalone."""
+    wynik = None
+    for p in pliki_env:
+        try:
+            st = os.stat(p)   # stat nie otwiera pliku, więc nie blokuje na potoku
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            continue
+        tekst = czytaj_zwykly(p, 64 * 1024)
+        if tekst is None:
+            raise Nieustalone(p)
+        v = wartosc_env(tekst, klucz)
+        if v is not None:
+            wynik = v
+    if wynik and "$" in wynik:
+        raise Nieustalone(klucz)
+    return wynik
+
+
+# Kolejność jak w compose-go: pierwszy istniejący plik bazowy + pierwszy override.
+PLIKI_COMPOSE = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+PLIKI_OVERRIDE = ("compose.override.yml", "compose.override.yaml",
+                  "docker-compose.override.yml", "docker-compose.override.yaml")
+
+
+def pliki_domyslne(katalog):
+    """Pliki, które wczyta zwykłe `docker compose up` (bez -f) w katalogu:
+    COMPOSE_FILE z `.env` (separator COMPOSE_PATH_SEPARATOR, domyślnie ':'),
+    inaczej pierwszy plik bazowy + pierwszy override. [] gdy katalog nie ma
+    pliku compose. Nieustalone przy potoku albo zmiennej `$…`."""
+    env = [os.path.join(katalog, ".env")]
+    lista = zmienna_env(env, "COMPOSE_FILE")
+    if lista:
+        sep = zmienna_env(env, "COMPOSE_PATH_SEPARATOR") or os.pathsep
+        return [os.path.normpath(os.path.join(katalog, p)) for p in lista.split(sep) if p]
+    wynik = []
+    for nazwy in (PLIKI_COMPOSE, PLIKI_OVERRIDE):
+        for n in nazwy:
+            if os.path.lexists(os.path.join(katalog, n)):
+                wynik.append(os.path.join(katalog, n))
+                break
+        if not wynik:
+            return []
+    return wynik
+
+
+def wywolanie_domyslne(pliki, katalog, pliki_env):
+    """Czy etykiety pasują do zwykłego `docker compose up` (bez -f i --env-file):
+    plik bazowy z PLIKI_COMPOSE (+ ewentualnie override) w katalogu projektu
+    i env co najwyżej `<katalog>/.env`. Jawne -f/--env-file (np. skrypt npm)
+    daje inne etykiety — wtedy w głównym checkoucie liczy się to samo polecenie."""
+    katalog = os.path.normpath(katalog)
+    if pliki_env and [os.path.normpath(p) for p in pliki_env] != [os.path.join(katalog, ".env")]:
+        return False
+    if not 1 <= len(pliki) <= 2:
+        return False
+    for plik, dozwolone in zip(pliki, (PLIKI_COMPOSE, PLIKI_OVERRIDE)):
+        plik = os.path.normpath(plik)
+        if os.path.dirname(plik) != katalog or os.path.basename(plik) not in dozwolone:
+            return False
+    return True
+
+
+def nazwa_projektu_glownego(pliki, katalog, pliki_env):
+    """Nazwa projektu, którą `docker compose` nadałby w głównym checkoucie przy
+    tych plikach: COMPOSE_PROJECT_NAME z plików env (ostatni wygrywa) →
+    `name:` (ostatni plik z tym kluczem wygrywa) → nazwa katalogu projektu.
+    '' gdy nie da się ustalić bez zgadywania: zmienna `$…`, brak pliku compose,
+    plik env, którego nie da się bezpiecznie przeczytać (potok, brak praw)."""
+    try:
+        env = zmienna_env(pliki_env, "COMPOSE_PROJECT_NAME")
+    except Nieustalone:
+        return ""
+    if env:
+        return nazwa_projektu_compose(env)
+    nazwa = None
+    for p in pliki:
+        tekst = czytaj_zwykly(p)
+        if tekst is None:
+            return ""
+        m = re.search(r"(?m)^name:[ \t]*['\"]?([^'\"#\s]+)", tekst)
+        if m:
+            nazwa = m.group(1)
+    if nazwa:
+        try:
+            nazwa = interpoluj(nazwa, pliki_env)
+        except Nieustalone:
+            return ""
+        return nazwa_projektu_compose(nazwa)
+    return nazwa_projektu_compose(os.path.basename(katalog.rstrip("/")))
+
+
+INTERPOLACJA = re.compile(
+    r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?)([-?])([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def interpoluj(tekst, pliki_env):
+    """Podstawienie zmiennych jak w Compose (np. DMS: `name: ${COMPOSE_PROJECT_NAME:-dms}`):
+    `$X`, `${X}`, `${X:-dom}` (domyślna, gdy brak lub puste), `${X-dom}` (gdy brak),
+    `${X:?…}`/`${X?…}`, `$$` → `$`. Wartości z tych samych plików env; zmienne
+    ustawione tylko w powłoce są niewidoczne — to samo założenie co dla zwykłego
+    `name:`. Brak wartości bez domyślnej, zagnieżdżenie, inna składnia albo pusty
+    wynik → Nieustalone (nie zgadujemy)."""
+    if "$" in INTERPOLACJA.sub("", tekst):
+        raise Nieustalone(tekst)   # składnia, której nie obsługujemy (np. ${X:+alt})
+
+    def podstaw(m):
+        if m.group(0) == "$$":
+            return "$"
+        zmienna = m.group(1) or m.group(5)
+        wartosc = zmienna_env(pliki_env, zmienna)
+        dwukropek, operator, domyslna = m.group(2), m.group(3), m.group(4)
+        brak = wartosc is None or (dwukropek == ":" and wartosc == "")
+        if not brak:
+            return wartosc
+        if operator == "-" and "$" not in domyslna:
+            return domyslna
+        raise Nieustalone(zmienna)
+
+    wynik = INTERPOLACJA.sub(podstaw, tekst)
+    if not nazwa_projektu_compose(wynik):
+        raise Nieustalone(tekst)
+    return wynik
+
+
+def stos_projektu(pliki_compose, projekt_compose, katalog_roboczy="", pliki_env=""):
+    """Nazwa repo, jeśli stos compose uruchomiony z worktree to wspólny stos
+    projektu. O wspólnych danych decyduje tylko NAZWA PROJEKTU (ta sama nazwa =
+    te same wolumeny i sieć), więc stos jest wspólny, gdy główny checkout dałby
+    tę samą nazwę w KAŻDYM typowym sposobie uruchomienia:
+      1. tym samym poleceniem co w worktree — pliki, env i katalog z etykiet
+         (`config_files`, `environment_file`, `working_dir`) przeniesione do
+         głównego checkoutu; pliki, których główny nie ma (własny override
+         worktree), pomijamy, bo nazwę projektu worktree i tak znamy z etykiety;
+      2. zwykłym `docker compose up` w katalogu projektu (auto-override,
+         COMPOSE_FILE i COMPOSE_PROJECT_NAME z `.env`) — tylko gdy etykiety
+         wyglądają na takie wywołanie; jawne -f/--env-file (skrypt) oznacza, że
+         główny checkout też startuje tym skryptem, czyli wariantem 1.
+    Główny checkout musi mieć co najmniej jeden z plików compose worktree.
+    Worktree, które postawiło własny projekt (inna nazwa, `-p`), zostaje testem —
+    sama zgodność container_name niczego nie dowodzi. Zmiennych powłoki
+    (COMPOSE_PROJECT_NAME, COMPOSE_FILE w środowisku) nie da się zobaczyć."""
+    def lista(tekst):
+        wynik = []
+        for p in (tekst or "").split(","):
+            p = p.strip()
+            if not p:
+                continue
+            if not os.path.isabs(p):   # stary docker-compose zapisywał ścieżki względne
+                if not katalog_roboczy:
+                    return None
+                p = os.path.normpath(os.path.join(katalog_roboczy, p))
+            wynik.append(p)
+        return wynik
+
+    pliki, envy = lista(pliki_compose), lista(pliki_env)
+    if not pliki or envy is None:
+        return ""
+    repo, glowne, wspolny_plik = "", [], False
+    for p in pliki:
+        odpowiednik, r = glowny_odpowiednik(p)
+        if odpowiednik is None:
+            glowne.append(p)   # plik spoza worktree — ten sam dla obu checkoutów
+            continue
+        if repo and r != repo:
+            return ""
+        repo = r
+        if os.path.lexists(odpowiednik):
+            glowne.append(odpowiednik)
+            wspolny_plik = True
+    if not repo or not wspolny_plik:
+        return ""               # nic z worktree albo główny nie ma żadnego z plików
+    katalog = (glowny_odpowiednik(katalog_roboczy)[0] or katalog_roboczy) if katalog_roboczy else ""
+    katalog = katalog or os.path.dirname(glowne[0])
+    if envy:
+        env_glowne = [glowny_odpowiednik(p)[0] or p for p in envy]
+    else:
+        env_glowne = [os.path.join(katalog, ".env")]
+    kandydaci = [nazwa_projektu_glownego(glowne, katalog, env_glowne)]
+    if wywolanie_domyslne(pliki, katalog_roboczy or os.path.dirname(pliki[0]), envy):
+        try:
+            domyslne = pliki_domyslne(katalog)
+        except Nieustalone:
+            return ""
+        if domyslne:
+            kandydaci.append(nazwa_projektu_glownego(domyslne, katalog, [os.path.join(katalog, ".env")]))
+    etykieta = nazwa_projektu_compose(projekt_compose or "")
+    if etykieta and all(k == etykieta for k in kandydaci):
+        return repo
+    return ""
+
+
 # Pamięć „pid:start → projekt” działających procesów: korzeń zapamiętany, póki
 # folder istniał, zostaje po jego usunięciu (nazwa i kolor nie przepadają).
 _PAMIEC_PROJEKTOW = {}
@@ -836,13 +1141,16 @@ def kontenery():
         insp = uruchom(["docker", "inspect", "--format",
                         "{{.State.StartedAt}}\t{{.State.Pid}}\t{{.Created}}\t{{.RestartCount}}\t"
                         "{{.HostConfig.RestartPolicy.Name}}\t"
-                        "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}", cid])
+                        "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}\t"
+                        "{{index .Config.Labels \"com.docker.compose.project.config_files\"}}\t"
+                        "{{index .Config.Labels \"com.docker.compose.project.environment_file\"}}", cid])
         cz = insp.strip().split("\t")
-        cz += [""] * (6 - len(cz))
+        cz += [""] * (8 - len(cz))
         info = {
             "start": czas_docker(cz[0]), "pid": int(cz[1]) if cz[1].isdigit() and cz[1] != "0" else None,
             "utworzony": czas_docker(cz[2]), "restarty": int(cz[3]) if cz[3].isdigit() else 0,
-            "polityka": cz[4] or "no", "katalog": cz[5], "compose": compose,
+            "polityka": cz[4] or "no", "katalog": cz[5], "pliki": cz[6], "pliki_env": cz[7],
+            "compose": compose,
         }
         tech = ("compose", compose) if compose else ("docker", "")
         for m in re.finditer(r"\[?([0-9a-fA-F.:*]+)\]?:(\d+)->", porty):
@@ -1196,7 +1504,16 @@ def zbierz():
         proj = projekt_info(k["katalog"]) if k["katalog"] else {"projekt": "", "worktree": False, "istnieje": True}
         kto["projekt"] = proj["projekt"]
         rodzaj = ""
-        if proj["worktree"]:
+        # Stos uruchomiony z worktree, ale zdefiniowany tak samo w głównym repo
+        # (ten sam projekt compose / kontener) — to wspólny stos projektu, nie test.
+        repo_stosu = (stos_projektu(k["pliki"], k["compose"], k["katalog"], k["pliki_env"])
+                      if proj["worktree"] and k["compose"] else "")
+        if repo_stosu:
+            kto["projekt"] = repo_stosu
+            powody.append(["stos-projektu", repo_stosu])
+            powody.append(["z-worktree" if proj["istnieje"] else "z-usunietego-worktree", proj["projekt"]])
+            proj = dict(proj, istnieje=True)   # definicja stosu żyje w głównym repo
+        elif proj["worktree"]:
             powody.append(["worktree", proj["projekt"]])
             rodzaj = "test"
         if not proj["istnieje"]:
@@ -1338,6 +1655,18 @@ def zapisz_cache_cpu(stan, teraz, projekty=None):
         pass
 
 
+LIMIT_SKANU = 60   # s; zwykle skan trwa ok. 1 s
+
+
+class PrzekroczonyCzas(BaseException):
+    """BaseException, żeby nie połknęło go żadne `except OSError/Exception`
+    wewnątrz skanu (TimeoutError jest podklasą OSError)."""
+
+
+def _przekroczony_czas(_sygnal, _ramka):
+    raise PrzekroczonyCzas(f"skan trwał dłużej niż {LIMIT_SKANU} s")
+
+
 def main():
     global BTIME
     BTIME = btime()
@@ -1355,11 +1684,17 @@ def main():
             sys.exit(1)
         print(json.dumps({"ok": True, "klucz": argv[1], argv[0]: wartosc}, ensure_ascii=False))
         return
+    # Ostatnia linia obrony: panel startuje nowy skan dopiero, gdy poprzedni się
+    # skończy, więc zawieszony skan zamroziłby go do restartu powłoki.
+    signal.signal(signal.SIGALRM, _przekroczony_czas)
+    signal.alarm(LIMIT_SKANU)
     try:
         uslugi = zbierz()
+        signal.alarm(0)
         print(json.dumps({"ok": True, "uslugi": uslugi,
                           "updatedAt": time.strftime("%H:%M:%S")}, ensure_ascii=False))
-    except Exception as e:  # noqa: BLE001
+    except (Exception, PrzekroczonyCzas) as e:  # noqa: BLE001
+        signal.alarm(0)
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
         sys.exit(1)
 
